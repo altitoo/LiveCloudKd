@@ -166,6 +166,7 @@ Project uses:
   * diStorm3 library (BSD license) by [Gil Dabah](https://x.com/_arkon): [Distorm project](https://github.com/gdabah/distorm).  
   * Singularity OS header files from Microsoft: [Project](https://www.microsoft.com/en-us/research/project/singularity/publications/), [Download link](https://github.com/lastweek/source-singularity).  
   * and some definitions from [Hypervisor Development Kit](https://github.com/ionescu007/hdk) by [Alex Ionescu](https://x.com/aionescu).    
+  * SAST Tools [PVS-Studio](https://pvs-studio.com/pvs-studio/?utm_source=website&utm_medium=github&utm_campaign=open_source) - static code analyzer for Enterprise (C, C++, C#, Go, and Java) and Web (JS and TS) development.
 
 [License to Hyper-V Memory Manager library](https://github.com/gerhart01/LiveCloudKd/blob/master/LiveCloudKdSdk/LICENSE.txt)
 
