@@ -7,6 +7,7 @@ extern BOOLEAN bIsPsGetCurrentPsPatched;
 NTSTATUS DeviceControlRoutine( IN PDEVICE_OBJECT fdo, IN PIRP Irp );
 VOID     UnloadRoutine(IN PDRIVER_OBJECT DriverObject);
 NTSTATUS Create_File_IRPprocessing(IN PDEVICE_OBJECT fdo, IN PIRP Irp);
+NTSTATUS Cleanup_IRPprocessing(IN PDEVICE_OBJECT fdo, IN PIRP Irp);
 NTSTATUS Close_HandleIRPprocessing(IN PDEVICE_OBJECT fdo, IN PIRP Irp);
 NTSTATUS ReadWrite_IRPhandler(IN PDEVICE_OBJECT fdo, IN PIRP Irp);
 
@@ -46,6 +47,7 @@ NTSTATUS DriverEntry( IN PDRIVER_OBJECT DriverObject,
 
 	DriverObject->DriverUnload = UnloadRoutine;
 	DriverObject->MajorFunction[IRP_MJ_CREATE]= Create_File_IRPprocessing;
+	DriverObject->MajorFunction[IRP_MJ_CLEANUP] = Cleanup_IRPprocessing;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = Close_HandleIRPprocessing;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL]= DeviceControlRoutine;
     DriverObject->MajorFunction[IRP_MJ_READ] = ReadWrite_IRPhandler;
@@ -103,13 +105,52 @@ NTSTATUS ReadWrite_IRPhandler( IN PDEVICE_OBJECT fdo, IN PIRP Irp )
 
 NTSTATUS Create_File_IRPprocessing(IN PDEVICE_OBJECT fdo,IN PIRP Irp)
 {
+	PIO_STACK_LOCATION IrpStack = IoGetCurrentIrpStackLocation(Irp);
 	UNREFERENCED_PARAMETER(fdo);
-	return CompleteIrp(Irp,STATUS_SUCCESS,0); 
+
+	//
+	// Give the handle its own guest-mapping list. IOCTL_MAP_GPA_RANGE hangs mappings here and
+	// IRP_MJ_CLEANUP tears them down.
+	//
+
+	if (IrpStack->FileObject != NULL) {
+		PHVMM_FILE_CONTEXT pFileContext = (PHVMM_FILE_CONTEXT)HvmmPoolAlloc(sizeof(HVMM_FILE_CONTEXT));
+		if (pFileContext != NULL) {
+			KeInitializeSpinLock(&pFileContext->Lock);
+			InitializeListHead(&pFileContext->MappingList);
+			IrpStack->FileObject->FsContext2 = pFileContext;
+		}
+	}
+
+	return CompleteIrp(Irp,STATUS_SUCCESS,0);
+}
+
+NTSTATUS Cleanup_IRPprocessing(IN PDEVICE_OBJECT fdo,IN PIRP Irp)
+{
+	PIO_STACK_LOCATION IrpStack = IoGetCurrentIrpStackLocation(Irp);
+	UNREFERENCED_PARAMETER(fdo);
+
+	if (IrpStack->FileObject != NULL) {
+		VidCleanupGpaMappings(IrpStack->FileObject);
+	}
+
+	return CompleteIrp(Irp,STATUS_SUCCESS,0);
 }
 
 NTSTATUS Close_HandleIRPprocessing(IN PDEVICE_OBJECT fdo,IN PIRP Irp)
 {
+	PIO_STACK_LOCATION IrpStack = IoGetCurrentIrpStackLocation(Irp);
 	UNREFERENCED_PARAMETER(fdo);
+
+	if (IrpStack->FileObject != NULL && IrpStack->FileObject->FsContext2 != NULL) {
+		//
+		// Cleanup already unmapped everything; free the list context and drop the pointer.
+		//
+		VidCleanupGpaMappings(IrpStack->FileObject);
+		HvmmPoolFree(IrpStack->FileObject->FsContext2);
+		IrpStack->FileObject->FsContext2 = NULL;
+	}
+
 	return CompleteIrp(Irp,STATUS_SUCCESS,0);
 }
 
@@ -296,6 +337,41 @@ NTSTATUS DeviceControlRoutine( IN PDEVICE_OBJECT fdo, IN PIRP Irp )
 			BytesTxd = uOutBufLen;
 		}
 		else {
+			BytesTxd = 0;
+		}
+		break;
+	}
+	case IOCTL_QUERY_MAPPING_SUPPORT:
+	{
+		ULONG QueryBytesReturned = 0;
+		if (VidQueryMappingSupport(pInputBuffer, uInputBufLen, uOutBufLen, &QueryBytesReturned) == TRUE) {
+			BytesTxd = QueryBytesReturned;
+		}
+		else {
+			status = STATUS_INVALID_PARAMETER;
+			BytesTxd = 0;
+		}
+		break;
+	}
+	case IOCTL_MAP_GPA_RANGE:
+	{
+		ULONG MapBytesReturned = 0;
+		if (VidMapGpaRange(IrpStack->FileObject, pInputBuffer, uInputBufLen, uOutBufLen, &MapBytesReturned) == TRUE) {
+			BytesTxd = MapBytesReturned;
+		}
+		else {
+			status = STATUS_UNSUCCESSFUL;
+			BytesTxd = 0;
+		}
+		break;
+	}
+	case IOCTL_UNMAP_GPA_RANGE:
+	{
+		if (VidUnmapGpaRange(IrpStack->FileObject, pInputBuffer, uInputBufLen) == TRUE) {
+			BytesTxd = 0;
+		}
+		else {
+			status = STATUS_UNSUCCESSFUL;
 			BytesTxd = 0;
 		}
 		break;

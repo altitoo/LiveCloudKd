@@ -3,3 +3,6 @@
 *.tlog
 *.ipch
 *.pdb
+
+# Visual Studio / WDK build outputs
+x64/

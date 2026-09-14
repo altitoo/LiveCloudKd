@@ -22,3 +22,9 @@ WriteFileSynchronous(
 	PVOID Buffer,
 	ULONG NbOfBytesToWrite
 );
+
+//
+// MappedMemoryDemo.c: verification and benchmark of the mapped guest memory path.
+//
+
+BOOLEAN MappedMemoryDemo(ULONG64 Partition);

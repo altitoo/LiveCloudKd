@@ -215,6 +215,7 @@ BOOLEAN Demo2()
 	wprintf(L"\n"
 		L"   Action List (enter 1 for demo):\n");
 	wprintf(L"    --> [1] Linear physical memory dump\n"); // Enter 1 for testing purposes. Save path looks like C:\Distr\Test\Example\test.raw
+	wprintf(L"    --> [2] Mapped memory: verify and benchmark (needs hvmm.sys with IOCTL_MAP_GPA_RANGE)\n");
 
 	if (Action == -1)
 	{
@@ -238,7 +239,7 @@ BOOLEAN Demo2()
 	wprintf(L"%d\n", ActionId);
 
 
-	if (ActionId != 0)
+	if (ActionId == 1)
 	{
 		wprintf(L"\n"
 			L"   Destination path for the virtual machine physical memory dump\n"
@@ -262,6 +263,17 @@ BOOLEAN Demo2()
 		wprintf(L"ERROR:    Cannot initialize hvdd structure.\n");
 		return FALSE;
 	};
+
+	if (ActionId == 2)
+	{
+		//
+		// Mapped memory path only: no writes, no suspend/resume demo below.
+		//
+		Ret = MappedMemoryDemo(g_CurrentPartitionIntHandle);
+		SdkClosePartition(g_CurrentPartitionIntHandle);
+		SdkCloseAllPartitions();
+		return Ret;
+	}
 
 	//
 	// Reading physical memory

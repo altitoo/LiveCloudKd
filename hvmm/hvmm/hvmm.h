@@ -13,6 +13,13 @@
 //Windows builds specific offsets
 //
 
+//
+// The fixed offsets in this file are the Windows 10 1803 layout and are kept as fallbacks
+// only. vid.sys moves them with every Windows build. VidResolveLayout (vid.c) finds the live
+// positions by scanning each structure for its signature ("Prtn", "Gpar", "Mb  ") and the
+// read paths use what it found. A field marked "fixed" below is the same on every build
+// checked so far; a field marked "moves" is one the scan resolves.
+//
 #define PARTITION_NAME_1803_OFFSET 0x78
 #define PARTITION_ID_1803_OFFSET 0x278
 
@@ -84,6 +91,38 @@
 	FILE_DEVICE_UNKNOWN, 0x833, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_ENABLE_VMWP_MITIGATIONS CTL_CODE(\
 	FILE_DEVICE_UNKNOWN, 0x834, METHOD_BUFFERED, FILE_ANY_ACCESS)
+//
+// Guest mapping IOCTLs. They start at 0x8A0, well above the existing codes, so they cannot
+// collide with codes other hvmm.sys builds use. Clients send IOCTL_QUERY_MAPPING_SUPPORT first
+// and nothing else unless it answers HVMM_MAPPING_SIGNATURE.
+//
+
+#define IOCTL_QUERY_MAPPING_SUPPORT CTL_CODE(\
+	FILE_DEVICE_UNKNOWN, 0x8A0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MAP_GPA_RANGE CTL_CODE(\
+	FILE_DEVICE_UNKNOWN, 0x8A1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_UNMAP_GPA_RANGE CTL_CODE(\
+	FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define HVMM_MAPPING_QUERY_MAGIC   (0x714D7648UL)   // "HvMq"
+#define HVMM_MAPPING_SIGNATURE     (0x704D7648UL)   // "HvMp"
+#define HVMM_MAPPING_VERSION       (1UL)
+
+//
+// One map call never spans more than 8 MB. The limit is the Size field of the MDL, a
+// signed CSHORT: sizeof(MDL) plus 8 bytes per page must stay below 32768, which is about
+// 4089 4 KB pages (16 MB). 8 MB leaves margin. The driver reports this value in the
+// handshake and clients chunk by what it reports.
+//
+
+#define HVMM_MAP_GPA_MAX_LENGTH (0x800000ULL)
+
+//
+// Live mappings one handle may hold at once. A 64 GB VM in 8 MB chunks is 8192; the cap
+// stops a caller from eating non-paged pool by mapping the same range forever.
+//
+
+#define HVMM_MAX_MAPPINGS_PER_HANDLE (16384UL)
 
 
 typedef PVOID MB_HANDLE;
@@ -167,6 +206,72 @@ typedef struct _VID_INJECTION_INFO {
 } VID_INJECTION_INFO, *PVID_INJECTION_INFO;
 
 //
+// IOCTL_MAP_GPA_RANGE: map a guest physical range into the calling process,
+// read-only, and keep it mapped. GpaStart and Length are byte counts and must be
+// page aligned. The driver maps the longest host-backed prefix of the range and
+// reports how many bytes it mapped in MappedBytes; the caller continues from there.
+//
+
+typedef struct _MAP_GPA_RANGE_INPUT {
+	HANDLE PartitionHandle;
+	UINT64 GpaStart;
+	UINT64 Length;
+} MAP_GPA_RANGE_INPUT, *PMAP_GPA_RANGE_INPUT;
+
+typedef struct _MAP_GPA_RANGE_OUTPUT {
+	PVOID UserVa;
+	UINT64 MappedBytes;
+} MAP_GPA_RANGE_OUTPUT, *PMAP_GPA_RANGE_OUTPUT;
+
+//
+// IOCTL_UNMAP_GPA_RANGE: unmap one range previously returned by IOCTL_MAP_GPA_RANGE.
+// UserVa is the value the map call reported.
+//
+
+typedef struct _UNMAP_GPA_RANGE_INPUT {
+	PVOID UserVa;
+} UNMAP_GPA_RANGE_INPUT, *PUNMAP_GPA_RANGE_INPUT;
+
+//
+// IOCTL_QUERY_MAPPING_SUPPORT: the handshake a client sends before any map request.
+// Input carries HVMM_MAPPING_QUERY_MAGIC; the driver answers with HVMM_MAPPING_SIGNATURE.
+//
+
+typedef struct _MAPPING_QUERY_INPUT {
+	UINT32 Magic;
+	UINT32 Reserved;
+} MAPPING_QUERY_INPUT, *PMAPPING_QUERY_INPUT;
+
+typedef struct _MAPPING_QUERY_OUTPUT {
+	UINT32 Signature;
+	UINT32 Version;
+	UINT64 MaxMapLength;
+} MAPPING_QUERY_OUTPUT, *PMAPPING_QUERY_OUTPUT;
+
+//
+// One live guest mapping, tracked per open handle to \\.\hvmm.
+//
+
+typedef struct _HVMM_GPA_MAPPING {
+	LIST_ENTRY Link;
+	PMDL Mdl;
+	PVOID UserVa;
+	PEPROCESS Process;
+	UINT64 MappedBytes;
+} HVMM_GPA_MAPPING, *PHVMM_GPA_MAPPING;
+
+//
+// Per file object state, hung off FILE_OBJECT->FsContext2. IRP_MJ_CLEANUP unmaps
+// everything still on the list, in the owning process context.
+//
+
+typedef struct _HVMM_FILE_CONTEXT {
+	KSPIN_LOCK Lock;
+	LIST_ENTRY MappingList;
+	ULONG MappingCount;
+} HVMM_FILE_CONTEXT, *PHVMM_FILE_CONTEXT;
+
+//
 // Internal vid.sys structures
 //
 
@@ -178,61 +283,103 @@ typedef struct _PARTITION_INFO {
 } PARTITION_INFO, *PPARTITION_INFO;
 
 typedef struct _MEMORY_BLOCK {
-	CHAR cMblockString[0x8]; // "Mb  " signature
-	PVOID PartitionHandle; // size 0x8
+	CHAR cMblockString[0x8]; // "Mb  " signature @ +0x0. fixed
+	PVOID PartitionHandle; // @ +0x8. fixed
 	CHAR Unknown01[0x8];
-	ULONG MbHandle;
+	ULONG MbHandle; // @ +0x18. fixed
 	CHAR Unknown02[0x1C];
 	ULONG64 BitMapSize01; // offset 0x38, size 0x8
 	ULONG64 BitMapSize02; // offset 0x40, size 0x8
 	CHAR Unknown03[0xA8];
-	PULONG64 pGuestGPAArray; //offset 0xF0, size 0x8
+	PULONG64 pGuestGPAArray; //offset 0xF0, size 0x8. moves: VM_LAYOUT.GuestGpaArrayOffset (entries at a 0x10 stride)
 } MEMORY_BLOCK, *PMEMORY_BLOCK;
 
 typedef struct _GPAR_OBJECT {
-	CHAR cGparSignature[0x8]; // "GPAR" signature - eq GPA Range
+	CHAR cGparSignature[0x8]; // "Gpar" signature @ +0x0 (0x72617047) - eq GPA Range. fixed
 	CHAR Unknown01[0xF8];
-    UINT64 GpaIndexStart; //offset +0x100, size 0x8
-    UINT64 GpaIndexEnd;  //offset +0x108, size 0x8
+    UINT64 GpaIndexStart; //offset +0x100, size 0x8. fixed
+    UINT64 GpaIndexEnd;  //offset +0x108, size 0x8. fixed
     UINT64 UnknowParam01;
     UINT64 UnknowParam02;
-    UINT32 KernelMemoryBlockGpaRangeFlags; //offset +0x120, size 0x4
+    UINT32 KernelMemoryBlockGpaRangeFlags; //offset +0x120, size 0x4. fixed
 	CHAR Unknown02[0x4C];
-	PMEMORY_BLOCK objMBlock; //offset +0x170, size 0x8 //in Windows 10 20H1 up to 0x8 bytes
-	ULONG64 SomeGpaOffset; //offset +0x178, size 0x8
-	ULONG64 VmmMemGpaOffset;//offset +0x180, size 0x8
+	PMEMORY_BLOCK objMBlock; //offset +0x170, size 0x8. moves: VM_LAYOUT.ObjMblockOffset
+	ULONG64 SomeGpaOffset; //offset +0x178, size 0x8. always objMBlock + 0x8
+	ULONG64 VmmMemGpaOffset;//offset +0x180, size 0x8. always objMBlock + 0x10
 } GPAR_OBJECT, *PGPAR_OBJECT;
 
 typedef struct _GPAR_BLOCK_HANDLE {
-    PVOID PartitionHandle;
-    PGPAR_OBJECT GparArray;
+    PVOID PartitionHandle; // @ +0x0. Points back to the "Prtn" partition. fixed
+    PGPAR_OBJECT GparArray; // @ +0x8. fixed
     UINT32 Unknown01;
-    UINT32 CountInGparArray;
+    UINT32 CountInGparArray; // @ +0x14 when the owner is a "Prtn" partition, +0x18 otherwise: VM_LAYOUT.GparCountOffset
 } GPAR_BLOCK_HANDLE, *PGPAR_BLOCK_HANDLE;
 
 
 typedef struct _MEMORY_BLOCK_ARRAY {
-	ULONG64 Count;
-	PULONG64 ArrayStart; // Start point to block of pointers to MBlock structures
+	ULONG64 Count; // @ +0x0. Element count; element 0 is the count, real blocks start at index 1 (see vid.c walk).
+	PULONG64 ArrayStart; // @ +0x8. Start point to block of pointers to MBlock structures. fixed
 } MEMORY_BLOCK_ARRAY, *PMEMORY_BLOCK_ARRAY;
 
+//
+// Signatures VidResolveLayout scans for. Each is the first 4 bytes of a vid.sys
+// structure, little endian. They do NOT move between Windows builds (the game engine
+// writes them verbatim), so they are the stable anchor the moving offsets are found by.
+//   "Prtn" = partition context, "Gpar" = one GPA range, "Mb  " = one memory block.
+//
+#define VID_SIG_PRTN 0x6e747250UL
+#define VID_SIG_GPAR 0x72617047UL
+#define VID_SIG_MB   0x2020624dUL
+
+//
+// Where every moving field of one partition sits, discovered at run time.
+//
+// vid.sys is recompiled by Windows updates and every offset below moves with it, so we do
+// NOT read them at the fixed 2018 positions the struct comments give (those are the fallback
+// only). Instead we scan each structure for its signature
+// (the vid.sys structures carry them). The offsets are the
+// same for every partition on one host (they are vid.sys-build constants), so they are found
+// once and cached; IsFullVm is re-checked per partition because it depends on that partition.
+//
+// Displacements are bytes: Name/PartitionId/MblockArray/GparHandle are into the "Prtn"
+// context; ObjMblock/SomeGpa/VmmMemGpa are into a "Gpar" object; GuestGpaArray is into a
+// "Mb  " block; GparCount is into the GPAR_BLOCK_HANDLE.
+//
+typedef struct _VM_LAYOUT {
+	PVOID   Context;             // partition context these offsets were validated against (cache key)
+	BOOLEAN Resolved;            // context is a "Prtn" partition and all required offsets are known
+	BOOLEAN IsFullVm;            // shape is a full, host-page-backed VM (not a container / exo partition)
+	ULONG   UsrVmType;           // USR_VM_TYPE reported to user mode (see enum), derived from the shape
+	ULONG   NameOffset;          // FriendlyName (inline UTF-16) inside the context
+	ULONG   PartitionIdOffset;   // HV_PARTITION_ID inside the context (= NameOffset + 0x200)
+	ULONG   MblockArrayOffset;   // MEMORY_BLOCK_ARRAY pointer inside the context
+	ULONG   GparHandleOffset;    // GPAR_BLOCK_HANDLE pointer inside the context
+	ULONG   GparCountOffset;     // CountInGparArray inside the GPAR_BLOCK_HANDLE (0x14 for "Prtn", else 0x18)
+	ULONG   ObjMblockOffset;     // MEMORY_BLOCK pointer inside a GPAR_OBJECT
+	ULONG   SomeGpaOffset;       // ULONG64 inside a GPAR_OBJECT (= ObjMblockOffset + 0x8), used by containers
+	ULONG   VmmMemGpaOffset;     // ULONG64 inside a GPAR_OBJECT (= ObjMblockOffset + 0x10), used by containers
+	ULONG   GuestGpaArrayOffset; // host-PFN array pointer inside a MEMORY_BLOCK
+} VM_LAYOUT, *PVM_LAYOUT;
+
+// The partition context is reached as (FILE_OBJECT->FsContext - 1). Every field below except
+// the signature moves between Windows builds; VidResolveLayout finds the live position.
 typedef struct _VM_PROCESS_CONTEXT {
-	CHAR cPrtnSignature[0x8];//Prtn signature
+	CHAR cPrtnSignature[0x8];//"Prtn" signature @ +0x0 (0x6e747250). fixed
 	CHAR Unknown01[0xF];
-	CHAR IsSecurePartition;//offset +0x18, size 0x1
+	CHAR IsSecurePartition;//offset +0x18, size 0x1. moves
     CHAR Unknown02[0x4F];
-	DWORD VmType; //offset +0x68 - size 0x4
+	DWORD VmType; //offset +0x68 - size 0x4. moves; full VMs are recognised by shape instead (VM_LAYOUT.IsFullVm)
 	CHAR Unknown03[0xC];
-    WCHAR FriendlyName[0x100]; //offset +0x78, size 0x200
-    HV_PARTITION_ID PartitionId; // offset +0x278, size 0x8
+    WCHAR FriendlyName[0x100]; //offset +0x78, size 0x200. moves: VM_LAYOUT.NameOffset
+    HV_PARTITION_ID PartitionId; // offset +0x278, size 0x8. always FriendlyName + 0x200
     CHAR Unknown04[0xF98];
-	PMEMORY_BLOCK_ARRAY ArrayOfMblocks;//offset +0x1218, size 0x8
+	PMEMORY_BLOCK_ARRAY ArrayOfMblocks;//offset +0x1218, size 0x8. moves: VM_LAYOUT.MblockArrayOffset
     CHAR Unknown05[0x300];
-    PGPAR_BLOCK_HANDLE pGparBlockHandle; // offset +0x1520, size 0x8
+    PGPAR_BLOCK_HANDLE pGparBlockHandle; // offset +0x1520, size 0x8. moves: VM_LAYOUT.GparHandleOffset
 	CHAR Unknown06[0x1570];
-	PMEMORY_BLOCK_ARRAY ArrayOfMblocks20H1;//offset +0x2A98, size 0x8
+	PMEMORY_BLOCK_ARRAY ArrayOfMblocks20H1;//offset +0x2A98, size 0x8. the 20H1 position of ArrayOfMblocks; the scan covers it
 	CHAR Unknown07[0x300];
-	PGPAR_BLOCK_HANDLE pGparBlockHandle20H1; // offset +0x2DA0, size 0x8
+	PGPAR_BLOCK_HANDLE pGparBlockHandle20H1; // offset +0x2DA0, size 0x8. the 20H1 position of pGparBlockHandle; the scan covers it
 	CHAR Unknown08[0xA8];
 } VM_PROCESS_CONTEXT, *PVM_PROCESS_CONTEXT;
 
@@ -264,8 +411,13 @@ BOOLEAN VidGetGparBlockInfoFromGPA(PCHAR pBuffer, ULONG len);
 PVOID VidPsProcessCheckWorker(PVOID pCurrentProcess, PVOID pRetAddress);
 BOOLEAN VidGetMBlockInfo(PCHAR pBuffer, ULONG len);
 BOOLEAN VidInternalReadMemory(PCHAR pBuffer, ULONG len);
-PGPAR_OBJECT VidGetGparObjectForGpa(PVM_PROCESS_CONTEXT pPartitionHandle, UINT64 GPA);
-BOOLEAN VidGetContainerMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PCHAR pBuffer, ULONG len, ULONG64 GPA);
+BOOLEAN VidQueryMappingSupport(PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
+BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
+BOOLEAN VidUnmapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen);
+VOID VidCleanupGpaMappings(PFILE_OBJECT FileObject);
+BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout);
+PGPAR_OBJECT VidGetGparObjectForGpa(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout, UINT64 GPA);
+BOOLEAN VidGetContainerMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout, PCHAR pBuffer, ULONG len, ULONG64 GPA);
 
 //
 // process.c
