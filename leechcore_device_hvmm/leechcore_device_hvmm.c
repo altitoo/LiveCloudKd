@@ -290,7 +290,110 @@ BOOL DeviceHVMM_CheckParams(_In_ PLC_CONTEXT ctxLC)
         }
     }
 
+    //
+    // "keepdriver": leave hvmm.sys loaded when this device closes. Several programs may
+    // have the VM open at the same time, and stopping the service under them takes the
+    // driver away from everyone. With this the driver is loaded on first use and stays
+    // until the machine reboots. LC_HVMM_KEEP_DRIVER=1 turns it on for programs whose
+    // device string cannot be changed.
+    //
+
+    if (StrStrIA(ctxLC->Config.szDevice, HVMM_KEEPDRIVER_PARAM_NAME))
+    {
+        ctx->KeepDriver = TRUE;
+        bResult = TRUE;
+    }
+    else
+    {
+        CHAR szEnv[8] = { 0 };
+        if (GetEnvironmentVariableA(HVMM_KEEPDRIVER_ENV_NAME, szEnv, sizeof(szEnv)) && szEnv[0] == '1')
+        {
+            ctx->KeepDriver = TRUE;
+        }
+    }
+
     return bResult;
+}
+
+/*
+* The service manager stores the driver file with a "\??\" prefix on some systems and
+* plain on others. Answer where the real path starts so two spellings of the same file
+* compare equal.
+*/
+static LPCSTR DeviceHVMM_SvcPathBody(_In_ LPCSTR szPath)
+{
+    if ((szPath[0] == '\\') && (szPath[1] == '?') && (szPath[2] == '?') && (szPath[3] == '\\')) { return szPath + 4; }
+    if ((szPath[0] == '\\') && (szPath[1] == '\\') && (szPath[2] == '?') && (szPath[3] == '\\')) { return szPath + 4; }
+    return szPath;
+}
+
+/*
+* An hvmm service is already there. A service keeps the driver file it was created with,
+* so if it points at another hvmm.sys our build never loads and every read is answered by
+* a stranger's driver. When that old service is stopped, throw it away and create it again
+* with the file next to leechcore.dll. When it is running, say so and stop: taking the
+* driver away from whoever is using it is not ours to do.
+*/
+static BOOL DeviceHVMM_SvcAdoptExisting(_In_ PLC_CONTEXT ctxLC, _In_ SC_HANDLE hSCM, _Inout_ SC_HANDLE *phSvcHvmm, _In_ LPSTR szDriverFile)
+{
+    BYTE pbConfig[8 * MAX_PATH] = { 0 };
+    LPQUERY_SERVICE_CONFIGA pConfig = (LPQUERY_SERVICE_CONFIGA)pbConfig;
+    SERVICE_STATUS_PROCESS SvcStatus = { 0 };
+    DWORD cbNeeded = 0;
+    LPCSTR szExisting;
+
+    if (!QueryServiceConfigA(*phSvcHvmm, pConfig, sizeof(pbConfig), &cbNeeded) || !pConfig->lpBinaryPathName) {
+        return TRUE;
+    }
+
+    szExisting = pConfig->lpBinaryPathName;
+
+    if (!lstrcmpiA(DeviceHVMM_SvcPathBody(szExisting), DeviceHVMM_SvcPathBody(szDriverFile))) {
+        return TRUE;
+    }
+
+    if (QueryServiceStatusEx(*phSvcHvmm, SC_STATUS_PROCESS_INFO, (LPBYTE)&SvcStatus, sizeof(SvcStatus), &cbNeeded) &&
+        (SvcStatus.dwCurrentState != SERVICE_STOPPED)) {
+        lcprintf(ctxLC,
+            "DEVICE_HVMM: ERROR: another hvmm.sys is loaded from '%s'; stop it first (this one needs '%s').\n",
+            szExisting,
+            szDriverFile);
+        return FALSE;
+    }
+
+    lcprintf(ctxLC,
+        "DEVICE_HVMM: the stopped hvmm service points at '%s'; creating it again with '%s'.\n",
+        szExisting,
+        szDriverFile);
+
+    if (!DeleteService(*phSvcHvmm)) {
+        lcprintf(ctxLC, "DEVICE_HVMM: ERROR: unable to delete the old hvmm service. LastError: 0x%08x\n", GetLastError());
+        return FALSE;
+    }
+
+    CloseServiceHandle(*phSvcHvmm);
+
+    *phSvcHvmm = CreateServiceA(
+        hSCM,
+        DEVICEHVMM_SERVICENAME,
+        DEVICEHVMM_SERVICENAME,
+        SERVICE_ALL_ACCESS,
+        SERVICE_KERNEL_DRIVER,
+        SERVICE_DEMAND_START,
+        SERVICE_ERROR_NORMAL,
+        szDriverFile,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL);
+
+    if (!*phSvcHvmm) {
+        lcprintf(ctxLC, "DEVICE_HVMM: ERROR: unable to create the hvmm service with '%s'. LastError: 0x%08x\n", szDriverFile, GetLastError());
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 _Success_(return)
@@ -352,6 +455,12 @@ BOOL DeviceHVMM_SvcStart(_In_ PLC_CONTEXT ctxLC)
         if (!hSvcHvmm) {
             if ((dwWinErr = GetLastError()) == ERROR_SERVICE_EXISTS) {
                 hSvcHvmm = OpenServiceA(hSCM, DEVICEHVMM_SERVICENAME, SERVICE_ALL_ACCESS);
+
+                if (hSvcHvmm && !DeviceHVMM_SvcAdoptExisting(ctxLC, hSCM, &hSvcHvmm, szDriverFile)) {
+                    if (hSvcHvmm) { CloseServiceHandle(hSvcHvmm); }
+                    CloseServiceHandle(hSCM);
+                    return FALSE;
+                }
             }
             else {
                 lcprintf(ctxLC,
@@ -368,7 +477,7 @@ BOOL DeviceHVMM_SvcStart(_In_ PLC_CONTEXT ctxLC)
             lcprintfv(ctxLC, "DEVICE_HVMM: ERROR: LastError: 0x%08x\n", dwWinErr);
             CloseServiceHandle(hSvcHvmm);
             CloseServiceHandle(hSCM);
-            DeviceHVMM_SvcClose();
+            if (!ctx->KeepDriver) { DeviceHVMM_SvcClose(); }
             return FALSE;
         }
 
@@ -387,7 +496,7 @@ BOOL DeviceHVMM_SvcStart(_In_ PLC_CONTEXT ctxLC)
             NULL);
 
         if (!ctx->hFile) {
-            DeviceHVMM_SvcClose();
+            if (!ctx->KeepDriver) { DeviceHVMM_SvcClose(); }
             return FALSE;
         }
     }
@@ -405,15 +514,18 @@ BOOL DeviceHVMM_SvcStart(_In_ PLC_CONTEXT ctxLC)
 VOID DeviceHVMM_Close(_Inout_ PLC_CONTEXT ctxLC)
 {
     PDEVICE_CONTEXT_HVMM ctx = (PDEVICE_CONTEXT_HVMM)ctxLC->hDevice;
+    BOOLEAN fKeepDriver = FALSE;
 
     if (g_cDeviceHVMM > 0)
         g_cDeviceHVMM -= 1;
 
     if (g_cDeviceHVMM)
         return;
-    
+
     if (ctx)
     {
+        fKeepDriver = ctx->KeepDriver;
+
         if (ctx->Mapped)
         {
             HvmmMappedClose(ctx->Mapped);
@@ -428,7 +540,14 @@ VOID DeviceHVMM_Close(_Inout_ PLC_CONTEXT ctxLC)
         LocalFree(ctx);
     }
 
-    DeviceHVMM_SvcClose();
+    //
+    // "keepdriver": the driver is loaded on first use and stays until the machine
+    // reboots. Other programs may have the VM open right now, and stopping the service
+    // pulls hvmm.sys out from under them.
+    //
+
+    if (!fKeepDriver)
+        DeviceHVMM_SvcClose();
 
     ctxLC->hDevice = 0;
 }

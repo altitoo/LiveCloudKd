@@ -46,6 +46,8 @@
 #define HVMM_ID_PARAM_NAME                      "id="
 #define HVMM_MAPPED_PARAM_NAME                  "mapped"
 #define HVMM_MAPPED_ENV_NAME                    "LC_HVMM_MAPPED"
+#define HVMM_KEEPDRIVER_PARAM_NAME              "keepdriver"
+#define HVMM_KEEPDRIVER_ENV_NAME                "LC_HVMM_KEEP_DRIVER"
 #define HVMM_MEMORY_TYPE_PARAM_NAME             "m="
 #define HVMM_LOGLEVEL_PARAM_NAME                "loglevel="
 
@@ -84,6 +86,7 @@ typedef struct tdDEVICE_CONTEXT_HVMM {
     BOOLEAN RemoteMode;
     LPWSTR szVmNamesList;
     BOOLEAN MappedRequested;            // "mapped" in the device string, or LC_HVMM_MAPPED=1
+    BOOLEAN KeepDriver;                 // "keepdriver" in the device string, or LC_HVMM_KEEP_DRIVER=1
     PHVMM_MAPPED_MEMORY Mapped;         // the read-only mapping of guest memory, NULL when not in use
     struct PmemMemoryInfo MemoryInfo;
 } DEVICE_CONTEXT_HVMM, *PDEVICE_CONTEXT_HVMM;
