@@ -431,6 +431,84 @@ VOID MappedMemoryLayoutReport(ULONG64 Partition)
 	CloseHandle(Device);
 }
 
+#define DEMO_IOCTL_GET_FRIENDLY_PARTITION_NAME CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define DEMO_ENUM_REPLY_BYTES 0x610
+
+typedef struct _DEMO_PARTITION_INFO {
+	HANDLE PartitionHandle;
+	ULONG64 VmwpPid;
+	ULONG64 ProcessPid;
+	ULONG VidInformationClass;
+} DEMO_PARTITION_INFO;
+
+static VOID DemoHexRows(PUCHAR p, ULONG cb, BOOLEAN SkipZeroRows)
+{
+	ULONG off, i;
+	for (off = 0; off < cb; off += 16) {
+		BOOLEAN AllZero = TRUE;
+		for (i = 0; i < 16 && off + i < cb; i++) { if (p[off + i]) { AllZero = FALSE; break; } }
+		if (SkipZeroRows && AllZero) { continue; }
+		wprintf(L"      +0x%04X ", off);
+		for (i = 0; i < 16 && off + i < cb; i++) { wprintf(L"%02X ", p[off + i]); }
+		wprintf(L"  ");
+		for (i = 0; i < 16 && off + i < cb; i++) { wprintf(L"%c", (p[off + i] >= 0x20 && p[off + i] < 0x7f) ? p[off + i] : L'.'); }
+		wprintf(L"\n");
+	}
+}
+
+//
+// Action 3: what the loaded driver answers to the enumeration request, byte by byte, and the
+// start of the partition context as our driver sees it. Run it against another hvmm.sys build
+// to learn what its reply carries that ours does not.
+//
+
+VOID MappedMemoryEnumDump(ULONG64 Partition)
+{
+	HANDLE Device;
+	HANDLE VidPartition;
+	DEMO_PARTITION_INFO In;
+	PUCHAR Reply;
+	DWORD Returned = 0;
+	PHVMM_PARTITION_LAYOUT L;
+
+	VidPartition = (HANDLE)SdkGetData2(Partition, InfoPartitionHandle);
+	Device = CreateFileW(HVMM_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (Device == INVALID_HANDLE_VALUE) {
+		wprintf(L"   cannot open the device (LastError %lu)\n", GetLastError());
+		return;
+	}
+
+	Reply = (PUCHAR)malloc(DEMO_ENUM_REPLY_BYTES);
+	if (Reply != NULL) {
+		RtlZeroMemory(&In, sizeof(In));
+		In.PartitionHandle = VidPartition;
+		In.ProcessPid = GetCurrentProcessId();
+		RtlZeroMemory(Reply, DEMO_ENUM_REPLY_BYTES);
+		if (DeviceIoControl(Device, DEMO_IOCTL_GET_FRIENDLY_PARTITION_NAME, &In, sizeof(In), Reply, DEMO_ENUM_REPLY_BYTES, &Returned, NULL)) {
+			wprintf(L"\n   Enumeration reply (IOCTL 0x820) for partition handle %p: %lu bytes, non-zero rows:\n", VidPartition, Returned);
+			DemoHexRows(Reply, Returned, TRUE);
+		}
+		else {
+			wprintf(L"\n   Enumeration reply (IOCTL 0x820): failed, LastError %lu\n", GetLastError());
+		}
+		free(Reply);
+	}
+
+	L = (PHVMM_PARTITION_LAYOUT)malloc(sizeof(HVMM_PARTITION_LAYOUT));
+	if (L != NULL) {
+		if (HvmmQueryPartitionLayout(Device, VidPartition, L) && L->Source == 0) {
+			wprintf(L"\n   Partition context as our driver sees it: %lu bytes, non-zero rows:\n", L->ContextBytes);
+			DemoHexRows(L->Context, L->ContextBytes, TRUE);
+		}
+		else {
+			wprintf(L"\n   (no layout query on this driver)\n");
+		}
+		free(L);
+	}
+
+	CloseHandle(Device);
+}
+
 BOOLEAN MappedMemoryDemo(ULONG64 Partition)
 {
 	PHVMM_MAPPED_MEMORY Mapped = NULL;

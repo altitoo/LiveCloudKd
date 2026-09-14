@@ -199,11 +199,27 @@ typedef struct _TRANSLATE_VA_RESULT {
     HV_TRANSLATE_GVA_RESULT TranslationResult;
 } TRANSLATE_VA_RESULT, *PTRANSLATE_VA_RESULT;
 
+//
+// The enumeration reply, laid out as hvlib.dll reads it (a 0x610-byte buffer):
+// the friendly name, then at +0x400 the partition id, at +0x408 the type, at +0x40C the
+// VM GUID as text ("XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", upper case, no braces).
+// hvlib exposes that text as InfoVmGuidString; MemProcFS-based tools pick the VM by it.
+// The window between the name and +0x400 carries the bytes that follow the name in the
+// partition context (the id, then the binary GUID), the way the shipped driver fills it.
+// The byte at +0x60D is 1 for a full VM in the shipped driver's reply; its meaning is not
+// known, it is set the same way.
+//
 typedef struct _VID_VM_INFO {
-    WCHAR FriendlyName[VID_PARTITION_FRIENDLY_NAME_MAX];
-    HV_PARTITION_ID PartitionId;
-	USR_VM_TYPE VmType;
-} VID_VM_INFO, *PVID_VM_INFO;
+    WCHAR FriendlyName[VID_PARTITION_FRIENDLY_NAME_MAX];   // +0x000, 0x400 bytes
+    HV_PARTITION_ID PartitionId;                           // +0x400
+	USR_VM_TYPE VmType;                                    // +0x408
+	WCHAR VmGuidString[0x40];                              // +0x40C
+	UCHAR Reserved[0x60D - 0x48C];                         // +0x48C
+	UCHAR FullVmFlag;                                      // +0x60D
+	UCHAR Reserved2[2];                                    // +0x60E
+} VID_VM_INFO, *PVID_VM_INFO;                              // sizeof == 0x610
+
+#define VID_VM_INFO_NAME_WINDOW_BYTES (0x400)
 
 typedef struct _REGISTER_VP_INFO {
 	ULONG64 PartitionId;
@@ -324,6 +340,8 @@ typedef struct _HVMM_LAST_READ_FAIL {
 	UINT8  Raw[64];      // first bytes of the request buffer, as the caller sent them
 } HVMM_LAST_READ_FAIL, *PHVMM_LAST_READ_FAIL;
 
+#define HVMM_CONTEXT_DUMP_BYTES 0x1000
+
 typedef struct _PARTITION_LAYOUT_QUERY_INPUT {
 	HANDLE PartitionHandle;
 } PARTITION_LAYOUT_QUERY_INPUT, *PPARTITION_LAYOUT_QUERY_INPUT;
@@ -344,6 +362,8 @@ typedef struct _PARTITION_LAYOUT_QUERY_OUTPUT {
 	UINT64 PartitionId;          // read at PartitionIdOffset
 	HVMM_IOCTL_STAT IoctlStats[HVMM_IOCTL_STAT_SLOTS]; // every request code seen since load, with call and failure counts
 	HVMM_LAST_READ_FAIL LastReadFail;                  // where the last failed classic read gave up
+	UINT32 ContextBytes;                               // how many bytes of the partition context follow
+	UINT8  Context[HVMM_CONTEXT_DUMP_BYTES];           // the start of the partition context, for support
 } PARTITION_LAYOUT_QUERY_OUTPUT, *PPARTITION_LAYOUT_QUERY_OUTPUT;
 
 //

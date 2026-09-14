@@ -227,6 +227,7 @@ BOOLEAN Demo2()
 		L"   Action List (enter 1 for demo):\n");
 	wprintf(L"    --> [1] Linear physical memory dump\n"); // Enter 1 for testing purposes. Save path looks like C:\Distr\Test\Example\test.raw
 	wprintf(L"    --> [2] Mapped memory: verify and benchmark (needs hvmm.sys with IOCTL_MAP_GPA_RANGE)\n");
+	wprintf(L"    --> [3] Dump the driver's enumeration reply and partition context (support)\n");
 
 	if (g_AutoActionId >= 0)
 	{
@@ -240,7 +241,7 @@ BOOLEAN Demo2()
 		wprintf(L"\n"
 			L"   Please select the Action ID\n"
 			L"   > ");
-		while ((ActionId < '0') || (ActionId > '2'))
+		while ((ActionId < '0') || (ActionId > '3'))
 		{
 			ActionId = _getch();
 		}
@@ -298,6 +299,14 @@ BOOLEAN Demo2()
 		SdkClosePartition(g_CurrentPartitionIntHandle);
 		SdkCloseAllPartitions();
 		return Ret;
+	}
+
+	if (ActionId == 3)
+	{
+		MappedMemoryEnumDump(g_CurrentPartitionIntHandle);
+		SdkClosePartition(g_CurrentPartitionIntHandle);
+		SdkCloseAllPartitions();
+		return TRUE;
 	}
 
 	//

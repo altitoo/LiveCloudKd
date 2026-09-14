@@ -29,6 +29,7 @@ WriteFileSynchronous(
 
 BOOLEAN MappedMemoryDemo(ULONG64 Partition);
 VOID MappedMemoryLayoutReport(ULONG64 Partition);
+VOID MappedMemoryEnumDump(ULONG64 Partition);
 
 //
 // Unattended run: "LiveCloudKdExample.exe <vm index> <action>" answers every prompt itself

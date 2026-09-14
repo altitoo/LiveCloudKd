@@ -138,6 +138,8 @@ typedef struct _HVMM_LAST_READ_FAIL {
 	UINT8  Raw[64];      // first bytes of the request buffer, as the caller sent them
 } HVMM_LAST_READ_FAIL, *PHVMM_LAST_READ_FAIL;
 
+#define HVMM_CONTEXT_DUMP_BYTES 0x1000
+
 typedef struct _HVMM_PARTITION_LAYOUT {
 	UINT32 Signature;
 	UINT32 ScanFlags;
@@ -155,6 +157,8 @@ typedef struct _HVMM_PARTITION_LAYOUT {
 
 	HVMM_IOCTL_STAT IoctlStats[HVMM_IOCTL_STAT_SLOTS];   // every request code the driver has seen since load
 	HVMM_LAST_READ_FAIL LastReadFail;                    // where the last failed classic read gave up
+	UINT32 ContextBytes;
+	UINT8  Context[HVMM_CONTEXT_DUMP_BYTES];
 } HVMM_PARTITION_LAYOUT, *PHVMM_PARTITION_LAYOUT;
 
 //

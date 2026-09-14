@@ -63,6 +63,22 @@ VOID DeviceHVMM_WriteScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ 
     return;
 }
 
+/*
+* A read through the mapping failed. That happens when the VM went away and the
+* pages are gone; drop the mapping so every later read takes the driver path,
+* which reports the real state of the partition.
+*/
+static VOID DeviceHVMM_MappedLost(_In_ PLC_CONTEXT ctxLC)
+{
+    PDEVICE_CONTEXT_HVMM ctx = (PDEVICE_CONTEXT_HVMM)ctxLC->hDevice;
+
+    if (!ctx->Mapped || HvmmMappedIsAlive(ctx->Mapped)) { return; }
+
+    lcprintf(ctxLC, "DEVICE_HVMM: the guest mapping is gone (VM stopped?), reads go through the driver from now on.\n");
+    HvmmMappedClose(ctx->Mapped);
+    ctx->Mapped = NULL;
+}
+
 VOID DeviceHVMM_ReadScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ PPMEM_SCATTER ppMEMs)
 {
     PDEVICE_CONTEXT_HVMM ctx = (PDEVICE_CONTEXT_HVMM)ctxLC->hDevice;
@@ -73,7 +89,13 @@ VOID DeviceHVMM_ReadScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ P
         pMEM = ppMEMs[i];
         if (pMEM->f || MEM_SCATTER_ADDR_ISINVALID(pMEM)) { continue; }
 
-        pMEM->f = HVMM_ReadFile(ctx->Partition, pMEM->qwA, pMEM->pb, pMEM->cb);
+        if (ctx->Mapped) {
+            pMEM->f = HvmmMappedRead(ctx->Mapped, pMEM->qwA, pMEM->pb, pMEM->cb);
+            if (!pMEM->f) { DeviceHVMM_MappedLost(ctxLC); }
+        }
+        if (!pMEM->f) {
+            pMEM->f = HVMM_ReadFile(ctx->Partition, pMEM->qwA, pMEM->pb, pMEM->cb);
+        }
 
         if (pMEM->f) {
             if (ctxLC->fPrintf[LC_PRINTF_VVV]) {
@@ -247,6 +269,27 @@ BOOL DeviceHVMM_CheckParams(_In_ PLC_CONTEXT ctxLC)
         bResult = TRUE;
     }
 
+    //
+    // "mapped": serve reads from a persistent read-only mapping of guest memory
+    // (IOCTL_MAP_GPA_RANGE in hvmm.sys) instead of one driver round trip per page.
+    // Full VMs only; anything not mapped falls back to the driver. LC_HVMM_MAPPED=1
+    // turns it on for programs whose device string cannot be changed.
+    //
+
+    if (StrStrIA(ctxLC->Config.szDevice, HVMM_MAPPED_PARAM_NAME))
+    {
+        ctx->MappedRequested = TRUE;
+        bResult = TRUE;
+    }
+    else
+    {
+        CHAR szEnv[8] = { 0 };
+        if (GetEnvironmentVariableA(HVMM_MAPPED_ENV_NAME, szEnv, sizeof(szEnv)) && szEnv[0] == '1')
+        {
+            ctx->MappedRequested = TRUE;
+        }
+    }
+
     return bResult;
 }
 
@@ -369,8 +412,14 @@ VOID DeviceHVMM_Close(_Inout_ PLC_CONTEXT ctxLC)
     if (g_cDeviceHVMM)
         return;
     
-    if (ctx) 
+    if (ctx)
     {
+        if (ctx->Mapped)
+        {
+            HvmmMappedClose(ctx->Mapped);
+            ctx->Mapped = NULL;
+        }
+
         SdkClosePartition((ULONG64)ctx->Partition);
 
         if (ctx->hFile)

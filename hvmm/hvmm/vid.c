@@ -1,4 +1,5 @@
 #include "hvmm.h"
+#include <ntstrsafe.h>
 
 PVOID g_vmmemHandle = NULL;
 EPROCESS_INTERNALS EprocessInternalData = { 0 };
@@ -59,6 +60,15 @@ static VOID VidFillLayoutReport(PCHAR ctx, PVM_LAYOUT Layout, PPARTITION_LAYOUT_
 		Output->GuestGpaArrayOffset = Layout->GuestGpaArrayOffset;
 		if (VidProbe(ctx + Layout->PartitionIdOffset)) {
 			Output->PartitionId = *(PULONG64)(ctx + Layout->PartitionIdOffset);
+		}
+		Output->ContextBytes = 0;
+		while (Output->ContextBytes < HVMM_CONTEXT_DUMP_BYTES && VidProbe(ctx + Output->ContextBytes)) {
+			ULONG chunk = PAGE_SIZE - (((ULONG_PTR)ctx + Output->ContextBytes) & (PAGE_SIZE - 1));
+			if (chunk > HVMM_CONTEXT_DUMP_BYTES - Output->ContextBytes) {
+				chunk = HVMM_CONTEXT_DUMP_BYTES - Output->ContextBytes;
+			}
+			RtlCopyMemory(Output->Context + Output->ContextBytes, ctx + Output->ContextBytes, chunk);
+			Output->ContextBytes += chunk;
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2022,8 +2032,40 @@ BOOLEAN VidGetFriendlyPartitionName(PCHAR pBuffer, ULONG len)
 		RtlZeroMemory(pBuffer, len);
 
 		pVmInfo = (PVID_VM_INFO)pBuffer;
-		RtlCopyMemory(pVmInfo->FriendlyName, ((PCHAR)pPartitionHandle + Layout.NameOffset), VID_PARTITION_NAME_BYTES_IN_CONTEXT);
-		RtlCopyMemory(&pVmInfo->PartitionId, ((PCHAR)pPartitionHandle + Layout.PartitionIdOffset), sizeof(pVmInfo->PartitionId));
+
+		//
+		// The reply starts with the 0x400 bytes that follow the name in the partition
+		// context (the name, the id, the binary GUID), copied page by page so a context
+		// that ends early cannot fault. Then the fields hvlib reads at fixed places.
+		//
+
+		{
+			ULONG copied = 0;
+			PCHAR src = (PCHAR)pPartitionHandle + Layout.NameOffset;
+			ULONG window = len < VID_VM_INFO_NAME_WINDOW_BYTES ? len : VID_VM_INFO_NAME_WINDOW_BYTES;
+
+			while (copied < window && VidProbe(src + copied)) {
+				ULONG chunk = PAGE_SIZE - (((ULONG_PTR)src + copied) & (PAGE_SIZE - 1));
+				if (chunk > window - copied) {
+					chunk = window - copied;
+				}
+				RtlCopyMemory(pBuffer + copied, src + copied, chunk);
+				copied += chunk;
+			}
+		}
+
+		if (len >= sizeof(VID_VM_INFO)) {
+			PUCHAR guid = (PUCHAR)pPartitionHandle + Layout.PartitionIdOffset + sizeof(HV_PARTITION_ID);
+
+			RtlCopyMemory(&pVmInfo->PartitionId, ((PCHAR)pPartitionHandle + Layout.PartitionIdOffset), sizeof(pVmInfo->PartitionId));
+
+			if (VidProbe(guid) && VidProbe(guid + 15)) {
+				RtlStringCchPrintfW(pVmInfo->VmGuidString, RTL_NUMBER_OF(pVmInfo->VmGuidString),
+					L"%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+					*(PULONG)guid, *(PUSHORT)(guid + 4), *(PUSHORT)(guid + 6),
+					guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
+			}
+		}
 
 		if (Layout.IsFullVm)
 		{
@@ -2035,6 +2077,9 @@ BOOLEAN VidGetFriendlyPartitionName(PCHAR pBuffer, ULONG len)
 
 			KDbgPrintString("Partition is a FULL VM (resolved by signature scan)");
 			pVmInfo->VmType = UsrVidVmTypeFullWinSrvVM;
+			if (len >= sizeof(VID_VM_INFO)) {
+				pVmInfo->FullVmFlag = 1;
+			}
 		}
 		else
 		{
