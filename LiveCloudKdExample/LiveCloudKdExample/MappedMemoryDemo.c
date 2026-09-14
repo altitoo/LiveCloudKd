@@ -14,6 +14,22 @@
 #include "HvmmMappedMemory.h"
 
 #define DEMO_COMPARE_PAGES      10000
+
+//
+// The classic per-page read request, sent by hand to tell a driver fault from an hvlib one.
+//
+
+#define DEMO_IOCTL_VID_INTERNAL_READ_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x830, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _DEMO_GPA_INFO {
+	HANDLE PartitionHandle;    // +0x00, the layout hvlib.dll sends
+	ULONG64 PartitionId;       // +0x08
+	ULONG64 VmwpProcessId;     // +0x10
+	ULONG64 Reserved18;
+	ULONG64 Reserved20;
+	ULONG64 StartPage;         // +0x28, bytes
+	ULONG64 BytesCount;        // +0x30, bytes
+} DEMO_GPA_INFO;
 #define DEMO_SCATTER_PAGES      512
 #define DEMO_CONTIG_BYTES       (16ULL * 1024 * 1024)
 #define DEMO_CONTIG_BLOCK       (1024 * 1024)   // what LiveCloudKd's dumper uses per read
@@ -96,6 +112,55 @@ static BOOLEAN DemoWriteMustFault(PHVMM_MAPPED_MEMORY Mapped)
 }
 
 //
+// One page through the classic read request, once by hand and once through hvlib, against
+// the mapping. Says which side fails when the byte compare cannot compare anything.
+//
+
+static VOID DemoPrintIoctlStats(PHVMM_PARTITION_LAYOUT L);
+
+static VOID DemoClassicReadProbe(ULONG64 Partition, PHVMM_MAPPED_MEMORY Mapped)
+{
+	UCHAR ViaIoctl[DUMP_PAGE_SIZE];
+	UCHAR ViaSdk[DUMP_PAGE_SIZE];
+	UCHAR ViaMap[DUMP_PAGE_SIZE];
+	DEMO_GPA_INFO Info;
+	DWORD Returned = 0;
+	BOOL Ok;
+	UINT64 Gpa = Mapped->Chunks[0].GpaStart + 0x10000;
+	HVMM_PARTITION_LAYOUT L;
+
+	wprintf(L"\n   Classic read path check at GPA 0x%llX (partition handle %p):\n", Gpa, Mapped->VidPartitionHandle);
+
+	if (HvmmQueryPartitionLayout(Mapped->DeviceHandle, Mapped->VidPartitionHandle, &L)) {
+		wprintf(L"    layout query through this handle: %s\n", L.Source == 0 ? L"resolved" : L"handle refused");
+		DemoPrintIoctlStats(&L);
+	}
+
+	HvmmMappedRead(Mapped, Gpa, ViaMap, DUMP_PAGE_SIZE);
+
+	RtlZeroMemory(&Info, sizeof(Info));
+	Info.StartPage = Gpa;
+	Info.BytesCount = DUMP_PAGE_SIZE;
+	Info.PartitionHandle = Mapped->VidPartitionHandle;
+	RtlZeroMemory(ViaIoctl, sizeof(ViaIoctl));
+	Ok = DeviceIoControl(Mapped->DeviceHandle, DEMO_IOCTL_VID_INTERNAL_READ_MEMORY, &Info, sizeof(Info), ViaIoctl, sizeof(ViaIoctl), &Returned, NULL);
+	wprintf(L"    driver IOCTL by hand:  ok=%d  bytes=%lu  LastError=%lu  %s\n", Ok, Returned, Ok ? 0 : GetLastError(),
+		(Ok && Returned == DUMP_PAGE_SIZE) ? (memcmp(ViaIoctl, ViaMap, DUMP_PAGE_SIZE) == 0 ? L"bytes equal the mapping" : L"bytes DIFFER from the mapping") : L"");
+
+	RtlZeroMemory(ViaSdk, sizeof(ViaSdk));
+	SetLastError(0);
+	Ok = SdkReadPhysicalMemory(Partition, Gpa, DUMP_PAGE_SIZE, ViaSdk, ReadInterfaceHvmmDrvInternal);
+	wprintf(L"    hvlib DrvInternal:     ok=%d  LastError=%lu  %s\n", Ok, GetLastError(),
+		Ok ? (memcmp(ViaSdk, ViaMap, DUMP_PAGE_SIZE) == 0 ? L"bytes equal the mapping" : L"bytes DIFFER from the mapping") : L"");
+
+	RtlZeroMemory(ViaSdk, sizeof(ViaSdk));
+	SetLastError(0);
+	Ok = SdkReadPhysicalMemory(Partition, Gpa, DUMP_PAGE_SIZE, ViaSdk, ReadInterfaceWinHv);
+	wprintf(L"    hvlib WinHv:           ok=%d  LastError=%lu  %s\n", Ok, GetLastError(),
+		Ok ? (memcmp(ViaSdk, ViaMap, DUMP_PAGE_SIZE) == 0 ? L"bytes equal the mapping" : L"bytes DIFFER from the mapping") : L"");
+}
+
+//
 // Byte compare. The VM should be suspended for this; a running guest changes
 // pages between the two reads and would show as mismatches. Pages that differ
 // are re-read once so a transient change is reported separately from a stable
@@ -171,7 +236,7 @@ static BOOLEAN DemoByteCompare(ULONG64 Partition, PHVMM_MAPPED_MEMORY Mapped, BO
 
 	free(ViaSdk);
 	free(ViaMap);
-	return Stable == 0 ? TRUE : FALSE;
+	return (Stable == 0 && Compared > 0) ? TRUE : FALSE;
 }
 
 static VOID DemoBenchmark(ULONG64 Partition, PHVMM_MAPPED_MEMORY Mapped)
@@ -258,7 +323,7 @@ static VOID DemoLifecycle(PHVMM_MAPPED_MEMORY Mapped)
 	int Key;
 
 	wprintf(L"\n   Lifecycle test: stop (or turn off) the VM now, then press 'y' here. Any other key skips.\n   > ");
-	Key = _getch();
+	Key = DemoReadKey('n');
 	wprintf(L"%c\n", Key);
 	if (Key != 'y' && Key != 'Y') {
 		return;
@@ -273,6 +338,97 @@ static VOID DemoLifecycle(PHVMM_MAPPED_MEMORY Mapped)
 		wprintf(L"read failed (fallback path)\n");
 	}
 	wprintf(L"   Start the VM again and rerun action 2 to check remap.\n");
+}
+
+static LPCWSTR DemoScanWord(UINT32 Flags, UINT32 Bit)
+{
+	return (Flags & Bit) ? L"found" : L"MISSING";
+}
+
+static VOID DemoPrintLayout(PHVMM_PARTITION_LAYOUT L)
+{
+	CHAR Tag[5];
+
+	RtlCopyMemory(Tag, &L->Signature, 4);
+	Tag[4] = 0;
+
+	wprintf(L"    signature      \"%S\" (0x%08X)%s\n", Tag, L->Signature, L->Signature == 0x6e747250 ? L"" : L"  <- not Prtn");
+	wprintf(L"    name/id        %s   gpar handle %s   objMBlock %s   host-pfn array %s   mblock array %s%s\n",
+		DemoScanWord(L->ScanFlags, HVMM_SCAN_NAME), DemoScanWord(L->ScanFlags, HVMM_SCAN_GPAR),
+		DemoScanWord(L->ScanFlags, HVMM_SCAN_OBJMBLOCK), DemoScanWord(L->ScanFlags, HVMM_SCAN_GPA_ARRAY),
+		DemoScanWord(L->ScanFlags, HVMM_SCAN_MBLOCKARRAY), (L->ScanFlags & HVMM_SCAN_CACHED) ? L"   (cached)" : L"");
+	wprintf(L"    offsets        name 0x%X  id 0x%X  gparHandle 0x%X (count +0x%X)  objMBlock 0x%X  hostPfnArray 0x%X  mblockArray 0x%X\n",
+		L->NameOffset, L->PartitionIdOffset, L->GparHandleOffset, L->GparCountOffset, L->ObjMblockOffset, L->GuestGpaArrayOffset, L->MblockArrayOffset);
+	wprintf(L"    full VM        %s   partition id 0x%llX   user type %lu\n", L->IsFullVm ? L"yes" : L"NO", L->PartitionId, L->UsrVmType);
+}
+
+static VOID DemoPrintIoctlStats(PHVMM_PARTITION_LAYOUT L)
+{
+	ULONG i;
+
+	wprintf(L"    requests seen by the driver since load (function code: calls / failures / last status):\n");
+	for (i = 0; i < HVMM_IOCTL_STAT_SLOTS && L->IoctlStats[i].Code != 0; i++) {
+		wprintf(L"      0x%03X: %lu / %lu / 0x%08X\n", (L->IoctlStats[i].Code >> 2) & 0xFFF, L->IoctlStats[i].Calls, L->IoctlStats[i].Failures, L->IoctlStats[i].LastStatus);
+	}
+
+	if (L->LastReadFail.Handle != 0 || L->LastReadFail.Step != 0) {
+		static LPCWSTR StepName[] = {
+			L"ok", L"handle refused", L"no partition context", L"not a full VM", L"length not page aligned",
+			L"page outside every GPA range", L"page in a vmwp descriptor", L"objMBlock NULL", L"host-pfn array NULL",
+			L"MDL allocation", L"map failed", L"copy faulted", L"no page backed" };
+		UINT32 Step = L->LastReadFail.Step < 13 ? L->LastReadFail.Step : 0;
+		wprintf(L"    last classic read: handle %p  GPA 0x%llX  length 0x%X  ->  %s (step %lu) at page 0x%llX, backed %lu, unbacked %lu\n",
+			(PVOID)L->LastReadFail.Handle, L->LastReadFail.Gpa, L->LastReadFail.Length, StepName[Step], L->LastReadFail.Step,
+			L->LastReadFail.FailPage, L->LastReadFail.Backed, L->LastReadFail.Unbacked);
+		wprintf(L"    request bytes as sent:");
+		for (i = 0; i < 64; i++) {
+			if ((i % 16) == 0) {
+				wprintf(L"\n      +0x%02X ", i);
+			}
+			wprintf(L"%02X ", L->LastReadFail.Raw[i]);
+		}
+		wprintf(L"\n");
+	}
+}
+
+VOID MappedMemoryLayoutReport(ULONG64 Partition)
+{
+	HANDLE Device;
+	HANDLE VidPartition;
+	HVMM_PARTITION_LAYOUT L;
+
+	VidPartition = (HANDLE)SdkGetData2(Partition, InfoPartitionHandle);
+	Device = CreateFileW(HVMM_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (Device == INVALID_HANDLE_VALUE) {
+		wprintf(L"   Layout report: cannot open \\\\.\\hvmm (LastError %lu)\n", GetLastError());
+		return;
+	}
+
+	//
+	// What the driver saw while hvlib enumerated the partitions. That call always carries a
+	// handle the driver can resolve, so this is the reliable picture.
+	//
+
+	if (HvmmQueryPartitionLayout(Device, NULL, &L)) {
+		wprintf(L"\n   Partition layout as the driver saw it during enumeration:\n");
+		DemoPrintLayout(&L);
+	}
+	else {
+		wprintf(L"   Layout report: the loaded hvmm.sys does not answer the layout query (LastError %lu)\n", GetLastError());
+	}
+
+	//
+	// The same query through the handle hvlib reports now. Before SdkSelectPartition this
+	// handle may not be one the driver can resolve; the source line says so.
+	//
+
+	if (VidPartition != NULL && HvmmQueryPartitionLayout(Device, VidPartition, &L)) {
+		wprintf(L"\n   Partition layout through hvlib's handle %p (%s):\n", VidPartition,
+			L.Source == 0 ? L"resolved" : L"handle refused, NTSTATUS in the id field");
+		DemoPrintLayout(&L);
+	}
+
+	CloseHandle(Device);
 }
 
 BOOLEAN MappedMemoryDemo(ULONG64 Partition)
@@ -307,8 +463,10 @@ BOOLEAN MappedMemoryDemo(ULONG64 Partition)
 		return FALSE;
 	}
 
+	DemoClassicReadProbe(Partition, Mapped);
+
 	wprintf(L"\n   Suspend the VM for the byte compare? (y/n) > ");
-	Key = _getch();
+	Key = DemoReadKey('n');
 	wprintf(L"%c\n", Key);
 	if (Key == 'y' || Key == 'Y') {
 		Suspended = SdkControlVmState(Partition, SuspendVm, SuspendResumePowershell, FALSE);

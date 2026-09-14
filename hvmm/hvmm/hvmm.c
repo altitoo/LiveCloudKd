@@ -13,6 +13,31 @@ NTSTATUS ReadWrite_IRPhandler(IN PDEVICE_OBJECT fdo, IN PIRP Irp);
 
 KSPIN_LOCK MySpinLock;
 
+static HVMM_IOCTL_STAT g_IoctlStats[HVMM_IOCTL_STAT_SLOTS];
+
+VOID HvmmNoteIoctl(ULONG Code, NTSTATUS Status, ULONG Bytes)
+{
+	ULONG i;
+
+	for (i = 0; i < HVMM_IOCTL_STAT_SLOTS; i++) {
+		if (g_IoctlStats[i].Code == Code || g_IoctlStats[i].Code == 0) {
+			g_IoctlStats[i].Code = Code;
+			g_IoctlStats[i].Calls++;
+			if (!NT_SUCCESS(Status) || Bytes == 0) {
+				g_IoctlStats[i].Failures++;
+				g_IoctlStats[i].LastStatus = (UINT32)Status;
+			}
+			return;
+		}
+	}
+}
+
+VOID HvmmCopyIoctlStats(PHVMM_IOCTL_STAT Stats, ULONG Slots)
+{
+	ULONG n = Slots < HVMM_IOCTL_STAT_SLOTS ? Slots : HVMM_IOCTL_STAT_SLOTS;
+	RtlCopyMemory(Stats, g_IoctlStats, n * sizeof(HVMM_IOCTL_STAT));
+}
+
 #define HVMM_MEMORY_TAG 'mmvH'
 
 PVOID HvmmPoolAlloc(SIZE_T size)
@@ -365,6 +390,18 @@ NTSTATUS DeviceControlRoutine( IN PDEVICE_OBJECT fdo, IN PIRP Irp )
 		}
 		break;
 	}
+	case IOCTL_QUERY_PARTITION_LAYOUT:
+	{
+		ULONG LayoutBytesReturned = 0;
+		if (VidQueryPartitionLayout(pInputBuffer, uInputBufLen, uOutBufLen, &LayoutBytesReturned) == TRUE) {
+			BytesTxd = LayoutBytesReturned;
+		}
+		else {
+			status = STATUS_UNSUCCESSFUL;
+			BytesTxd = 0;
+		}
+		break;
+	}
 	case IOCTL_UNMAP_GPA_RANGE:
 	{
 		if (VidUnmapGpaRange(IrpStack->FileObject, pInputBuffer, uInputBufLen) == TRUE) {
@@ -380,7 +417,10 @@ NTSTATUS DeviceControlRoutine( IN PDEVICE_OBJECT fdo, IN PIRP Irp )
 	default: status = STATUS_INVALID_DEVICE_REQUEST;
 	}
 End:
-return CompleteIrp(Irp,status,BytesTxd); 
+	if (ControlCode != IOCTL_QUERY_PARTITION_LAYOUT) {
+		HvmmNoteIoctl(ControlCode, status, BytesTxd);
+	}
+return CompleteIrp(Irp,status,BytesTxd);
 }
 
 

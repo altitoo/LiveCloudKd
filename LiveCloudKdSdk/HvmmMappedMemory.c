@@ -124,6 +124,27 @@ BOOLEAN HvmmQueryMappingSupport(_In_ HANDLE DeviceHandle, _Out_opt_ PUINT64 MaxM
 	return TRUE;
 }
 
+BOOLEAN HvmmQueryPartitionLayout(_In_ HANDLE DeviceHandle, _In_ HANDLE VidPartitionHandle, _Out_ PHVMM_PARTITION_LAYOUT Layout)
+{
+	HVMM_PARTITION_LAYOUT_QUERY_INPUT Input;
+	DWORD BytesReturned = 0;
+
+	RtlZeroMemory(Layout, sizeof(*Layout));
+
+	if (DeviceHandle == NULL || DeviceHandle == INVALID_HANDLE_VALUE) {
+		SetLastError(ERROR_INVALID_HANDLE);
+		return FALSE;
+	}
+
+	Input.PartitionHandle = VidPartitionHandle;
+
+	if (!DeviceIoControl(DeviceHandle, HVMM_IOCTL_QUERY_PARTITION_LAYOUT, &Input, sizeof(Input), Layout, sizeof(*Layout), &BytesReturned, NULL)) {
+		return FALSE;
+	}
+
+	return BytesReturned == sizeof(*Layout) ? TRUE : FALSE;
+}
+
 BOOLEAN HvmmMapGpaRange(_In_ HANDLE DeviceHandle, _In_ HANDLE VidPartitionHandle, _In_ UINT64 GpaStart, _In_ UINT64 Length, _Out_ PVOID *UserVa, _Out_ PUINT64 MappedBytes)
 {
 	HVMM_MAP_GPA_RANGE_INPUT Input;

@@ -13,6 +13,12 @@ EPROCESS_INTERNALS EprocessInternalData = { 0 };
 static VM_LAYOUT g_DiscoveredLayout = { 0 };
 
 //
+// The last classic read that failed, for the layout query. Diagnostic only.
+//
+
+static HVMM_LAST_READ_FAIL g_LastReadFail = { 0 };
+
+//
 // True when p is a canonical kernel address whose page is resident. Reject anything below
 // the kernel half before touching MmIsAddressValid, so a
 // stray user or non-canonical pointer never reaches it. Every candidate pointer in a scan goes
@@ -25,6 +31,39 @@ static BOOLEAN VidProbe(PVOID p)
 		return FALSE;
 	}
 	return MmIsAddressValid(p);
+}
+
+//
+// What the last enumeration (VidGetFriendlyPartitionName) saw. The layout query returns it
+// when the caller has no partition handle yet, which is the case before SdkSelectPartition.
+//
+
+static PARTITION_LAYOUT_QUERY_OUTPUT g_LastEnumLayout = { 0 };
+
+static VOID VidFillLayoutReport(PCHAR ctx, PVM_LAYOUT Layout, PPARTITION_LAYOUT_QUERY_OUTPUT Output)
+{
+	RtlZeroMemory(Output, sizeof(*Output));
+	__try {
+		if (VidProbe(ctx)) {
+			Output->Signature = *(PULONG)ctx;
+		}
+		Output->ScanFlags = Layout->ScanFlags;
+		Output->IsFullVm = Layout->IsFullVm ? 1 : 0;
+		Output->UsrVmType = Layout->UsrVmType;
+		Output->NameOffset = Layout->NameOffset;
+		Output->PartitionIdOffset = Layout->PartitionIdOffset;
+		Output->MblockArrayOffset = Layout->MblockArrayOffset;
+		Output->GparHandleOffset = Layout->GparHandleOffset;
+		Output->GparCountOffset = Layout->GparCountOffset;
+		Output->ObjMblockOffset = Layout->ObjMblockOffset;
+		Output->GuestGpaArrayOffset = Layout->GuestGpaArrayOffset;
+		if (VidProbe(ctx + Layout->PartitionIdOffset)) {
+			Output->PartitionId = *(PULONG64)(ctx + Layout->PartitionIdOffset);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		KDbgLog("VidFillLayoutReport: exception", GetExceptionCode());
+	}
 }
 
 //
@@ -300,11 +339,11 @@ BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayou
 
 		if (g_DiscoveredLayout.Resolved) {
 			local = g_DiscoveredLayout;
+			local.ScanFlags |= VID_SCAN_CACHED;
 			discovered = TRUE;
 		} else {
 			PGPAR_OBJECT firstGpar = NULL;
-			PMEMORY_BLOCK firstMblock = NULL;
-			BOOLEAN haveName, haveGpar, haveObjMb = FALSE, haveArray = FALSE;
+			BOOLEAN haveName, haveGpar, haveObjMb = FALSE, haveArray = FALSE, haveMbArray;
 
 			local.NameOffset = PARTITION_NAME_1803_OFFSET;
 			local.PartitionIdOffset = PARTITION_ID_1803_OFFSET;
@@ -318,18 +357,57 @@ BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayou
 
 			haveName = VidScanNameOffset(ctx, &local.NameOffset, &local.PartitionIdOffset);
 			haveGpar = VidScanGparHandleOffset(ctx, &local.GparHandleOffset, &local.GparCountOffset, &firstGpar);
+
+			//
+			// The two inner scans need a GPA range whose memory block is host backed. Not every
+			// range is (a small one may hold no pages yet), so walk the whole GPAR array and
+			// take the first range where both scans succeed.
+			//
+
 			if (haveGpar && firstGpar != NULL) {
-				haveObjMb = VidScanObjMblockOffset((PCHAR)firstGpar, &local.ObjMblockOffset);
-				if (haveObjMb) {
+				PCHAR handle = *(PCHAR*)(ctx + local.GparHandleOffset);
+				PVOID *gparArray = *(PVOID**)(handle + 8);
+				UINT32 count = *(PUINT32)(handle + local.GparCountOffset);
+				UINT32 k;
+
+				if (count > 4096) {
+					count = 4096;
+				}
+
+				for (k = 0; k < count && !(haveObjMb && haveArray); k++) {
+					PCHAR gpar;
+					PMEMORY_BLOCK mblock;
+
+					if (!VidProbe(gparArray + k)) {
+						continue;
+					}
+					gpar = (PCHAR)gparArray[k];
+					if (!VidProbe(gpar) || *(PULONG)gpar != VID_SIG_GPAR) {
+						continue;
+					}
+
+					haveObjMb = VidScanObjMblockOffset(gpar, &local.ObjMblockOffset);
+					haveArray = FALSE;
+					if (!haveObjMb) {
+						continue;
+					}
+
 					local.SomeGpaOffset = local.ObjMblockOffset + 0x8;
 					local.VmmMemGpaOffset = local.ObjMblockOffset + 0x10;
-					firstMblock = *(PMEMORY_BLOCK*)((PCHAR)firstGpar + local.ObjMblockOffset);
-					if (VidProbe(firstMblock)) {
-						haveArray = VidScanGuestGpaArrayOffset((PCHAR)firstMblock, &local.GuestGpaArrayOffset);
+					mblock = *(PMEMORY_BLOCK*)(gpar + local.ObjMblockOffset);
+					if (VidProbe(mblock)) {
+						haveArray = VidScanGuestGpaArrayOffset((PCHAR)mblock, &local.GuestGpaArrayOffset);
 					}
 				}
 			}
-			VidScanMblockArrayOffset(ctx, &local.MblockArrayOffset);
+			haveMbArray = VidScanMblockArrayOffset(ctx, &local.MblockArrayOffset);
+
+			local.ScanFlags =
+				(haveName ? VID_SCAN_NAME : 0) |
+				(haveGpar ? VID_SCAN_GPAR : 0) |
+				(haveObjMb ? VID_SCAN_OBJMBLOCK : 0) |
+				(haveArray ? VID_SCAN_GPA_ARRAY : 0) |
+				(haveMbArray ? VID_SCAN_MBLOCKARRAY : 0);
 
 			if (haveName && haveGpar && haveObjMb && haveArray) {
 				local.Context = pPartitionHandle;
@@ -353,6 +431,7 @@ BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayou
 		//
 		pLayout->Resolved = TRUE;
 		pLayout->IsFullVm = FALSE;
+		pLayout->ScanFlags = local.ScanFlags;
 		return TRUE;
 	}
 
@@ -365,6 +444,7 @@ BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayou
 	pLayout->SomeGpaOffset = local.SomeGpaOffset;
 	pLayout->VmmMemGpaOffset = local.VmmMemGpaOffset;
 	pLayout->GuestGpaArrayOffset = local.GuestGpaArrayOffset;
+	pLayout->ScanFlags = local.ScanFlags;
 	pLayout->Resolved = TRUE;
 
 	pLayout->IsFullVm = VidValidateFullVm(ctx, pLayout);
@@ -721,6 +801,7 @@ BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT
 
 	PVOID SourceAddress = NULL;
 	ULONG64 uBlocks, uRemainBytes, i;
+	ULONG Backed = 0, Unbacked = 0;
 
 	//DbgBreakPoint();
 
@@ -729,37 +810,51 @@ BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT
 
 	if (uRemainBytes != 0) {
 		KDbgPrintString("Buffer Length must be paged size alignment");
+		g_LastReadFail.Step = HVMM_READ_FAIL_LENGTH;
 		return FALSE;
 	}
 
+	//
+	// A page the host does not back (a hole between GPA ranges, a vmwp.exe descriptor, a
+	// block with no host-PFN array) is left zero and the walk goes on, the way a physical
+	// dump expects. The request fails only when no page of it was backed. The first such
+	// page is noted for the layout query.
+	//
+
 	for (i = 0; i < uBlocks; i++)
 	{
+		ULONG Step = 0;
 
 		objGpar = VidGetGparObjectForGpa(pPartitionHandle, pLayout, GPA+i);
 
-		if (objGpar == NULL) {
-			return FALSE;
+		if (objGpar == NULL ||
+			GPA + i < objGpar->GpaIndexStart ||
+			GPA + i > objGpar->GpaIndexEnd) {
+			Step = HVMM_READ_FAIL_NO_GPAR;
+		}
+		else if (objGpar->GpaIndexStart == objGpar->GpaIndexEnd) {
+			Step = HVMM_READ_FAIL_VMWP_RANGE;
+		}
+		else {
+			objMBlock = (PMEMORY_BLOCK)*(PVOID*)((PCHAR)objGpar + pLayout->ObjMblockOffset);
+			if (objMBlock == NULL) {
+				Step = HVMM_READ_FAIL_NO_MBLOCK;
+			}
+			else {
+				pGuestGpaArray = (PULONG64)*(PVOID*)((PCHAR)objMBlock + pLayout->GuestGpaArrayOffset);
+				if (pGuestGpaArray == NULL) {
+					Step = HVMM_READ_FAIL_NO_ARRAY;
+				}
+			}
 		}
 
-		if (objGpar->GpaIndexStart == objGpar->GpaIndexEnd) {
-			KDbgPrintString("MBlock in GPAR object is vmwp.exe descriptor");
-			return FALSE;
-		}
-
-		//
-		// objMBlock and its host-PFN array both sit at discovered offsets (they move every
-		// vid.sys build), so read them through the layout, not the fixed struct fields.
-		//
-
-		objMBlock = (PMEMORY_BLOCK)*(PVOID*)((PCHAR)objGpar + pLayout->ObjMblockOffset);
-		if (objMBlock == NULL) {
-			KDbgPrintString("objMBlock is NULL");
-			return FALSE;
-		}
-		pGuestGpaArray = (PULONG64)*(PVOID*)((PCHAR)objMBlock + pLayout->GuestGpaArrayOffset);
-		if (pGuestGpaArray == NULL) {
-			KDbgPrintString("pGuestGPAArray is NULL");
-			return FALSE;
+		if (Step != 0) {
+			if (Unbacked == 0) {
+				g_LastReadFail.Step = Step;
+				g_LastReadFail.FailPage = GPA + i;
+			}
+			Unbacked++;
+			continue;
 		}
 
 		HostSPA = *(PULONG)((PCHAR)pGuestGpaArray + 0x10 * (GPA- objGpar->GpaIndexStart +i));
@@ -768,9 +863,11 @@ BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT
 
 		if (pMDL == NULL) {
 			KDbgPrintString("MDL allocation false");
+			g_LastReadFail.Step = HVMM_READ_FAIL_MDL;
+			g_LastReadFail.FailPage = GPA + i;
 			return FALSE;
 		}
-		
+
 		MdlPfnArray = MmGetMdlPfnArray(pMDL);
 		*MdlPfnArray = HostSPA;
 
@@ -781,21 +878,36 @@ BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT
 			if (!SourceAddress)
 			{
 				IoFreeMdl(pMDL);
+				g_LastReadFail.Step = HVMM_READ_FAIL_MAP;
+				g_LastReadFail.FailPage = GPA + i;
 				return FALSE;
 			}
-				
+
 			RtlCopyMemory(pBuffer + i * PAGE_SIZE, SourceAddress, PAGE_SIZE);
 
 			MmUnmapLockedPages(SourceAddress, pMDL);
+			Backed++;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
 			KDbgLog("   RtlCopyMemory failed", GetExceptionCode());
+			g_LastReadFail.Step = HVMM_READ_FAIL_EXCEPTION;
+			g_LastReadFail.FailPage = GPA + i;
 		}
-		
+
 		IoFreeMdl(pMDL);
 	}
-	
+
+	g_LastReadFail.Backed = Backed;
+	g_LastReadFail.Unbacked = Unbacked;
+
+	if (Backed == 0) {
+		if (g_LastReadFail.Step == 0) {
+			g_LastReadFail.Step = HVMM_READ_FAIL_ALL_UNBACKED;
+		}
+		return FALSE;
+	}
+
 	return TRUE;
 }
 
@@ -844,10 +956,19 @@ BOOLEAN VidInternalReadMemory(PCHAR pBuffer, ULONG len)
 	//DbgBreakPoint();
 
 	RtlCopyMemory(&GpaInfo, pBuffer, sizeof(GpaInfo));
-	memset(pBuffer, 0, len);
 
 	GPA = GpaInfo.StartPage / PAGE_SIZE;
 	//KDbgLog16("GPA = ", GPA);
+
+	RtlZeroMemory(&g_LastReadFail, sizeof(g_LastReadFail));
+	g_LastReadFail.Handle = (UINT64)GpaInfo.PartitionHandle;
+	g_LastReadFail.Gpa = GpaInfo.StartPage;
+	g_LastReadFail.Length = len;
+	RtlCopyMemory(g_LastReadFail.Raw, &GpaInfo, sizeof(GpaInfo));
+	if (len >= sizeof(g_LastReadFail.Raw)) {
+		RtlCopyMemory(g_LastReadFail.Raw, pBuffer, sizeof(g_LastReadFail.Raw));
+	}
+	memset(pBuffer, 0, len);
 
 	Status = ObReferenceObjectByHandle(GpaInfo.PartitionHandle,
 		READ_CONTROL,
@@ -860,7 +981,13 @@ BOOLEAN VidInternalReadMemory(PCHAR pBuffer, ULONG len)
 	{
 		KDbgLog("VidInternalReadMemory.ObReferenceObjectByHandle failed. Status ", Status);
 		KDbgLog16("GpaInfo.PartitionHandle ", (ULONG64)GpaInfo.PartitionHandle);
+		g_LastReadFail.Step = HVMM_READ_FAIL_HANDLE;
 		return FALSE;
+	}
+
+	if (objVmPartition->FsContext == NULL)
+	{
+		g_LastReadFail.Step = HVMM_READ_FAIL_NO_CONTEXT;
 	}
 
 	if (objVmPartition->FsContext != NULL)
@@ -899,6 +1026,7 @@ BOOLEAN VidInternalReadMemory(PCHAR pBuffer, ULONG len)
 				break;
 
 			default:
+				g_LastReadFail.Step = HVMM_READ_FAIL_NOT_FULL_VM;
 				break;
 			}
 		}
@@ -1010,6 +1138,75 @@ static VOID VidReleaseGpaMapping(PHVMM_GPA_MAPPING pMapping)
 }
 
 //
+// Report what the layout scan found for one partition. Diagnostic only: nothing is mapped.
+//
+
+BOOLEAN VidQueryPartitionLayout(PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned)
+{
+	PARTITION_LAYOUT_QUERY_INPUT Input;
+	PARTITION_LAYOUT_QUERY_OUTPUT Output;
+	NTSTATUS Status;
+	PFILE_OBJECT objVmPartition = NULL;
+	PCHAR ctx;
+	VM_LAYOUT Layout;
+
+	*pBytesReturned = 0;
+
+	if (inLen < sizeof(PARTITION_LAYOUT_QUERY_INPUT) || outLen < sizeof(PARTITION_LAYOUT_QUERY_OUTPUT)) {
+		return FALSE;
+	}
+
+	RtlCopyMemory(&Input, pBuffer, sizeof(Input));
+	RtlZeroMemory(&Output, sizeof(Output));
+
+	if (Input.PartitionHandle == NULL) {
+		Output = g_LastEnumLayout;
+		Output.Source = 1;
+		HvmmCopyIoctlStats(Output.IoctlStats, HVMM_IOCTL_STAT_SLOTS);
+		Output.LastReadFail = g_LastReadFail;
+		RtlCopyMemory(pBuffer, &Output, sizeof(Output));
+		*pBytesReturned = sizeof(Output);
+		return TRUE;
+	}
+
+	Status = ObReferenceObjectByHandle(Input.PartitionHandle,
+		READ_CONTROL,
+		*IoFileObjectType,
+		KernelMode,
+		&objVmPartition,
+		NULL);
+
+	if (!NT_SUCCESS(Status)) {
+		KDbgLog("VidQueryPartitionLayout.ObReferenceObjectByHandle failed. Status ", Status);
+		Output.Source = 2;
+		Output.PartitionId = (UINT64)(LONG)Status;
+		HvmmCopyIoctlStats(Output.IoctlStats, HVMM_IOCTL_STAT_SLOTS);
+		Output.LastReadFail = g_LastReadFail;
+		RtlCopyMemory(pBuffer, &Output, sizeof(Output));
+		*pBytesReturned = sizeof(Output);
+		return TRUE;
+	}
+
+	if (objVmPartition->FsContext == NULL) {
+		ObDereferenceObject(objVmPartition);
+		return FALSE;
+	}
+
+	ctx = (PCHAR)objVmPartition->FsContext - 1;
+
+	VidResolveLayout((PVM_PROCESS_CONTEXT)ctx, &Layout);
+	VidFillLayoutReport(ctx, &Layout, &Output);
+	HvmmCopyIoctlStats(Output.IoctlStats, HVMM_IOCTL_STAT_SLOTS);
+	Output.LastReadFail = g_LastReadFail;
+
+	ObDereferenceObject(objVmPartition);
+
+	RtlCopyMemory(pBuffer, &Output, sizeof(Output));
+	*pBytesReturned = sizeof(Output);
+	return TRUE;
+}
+
+//
 // Map a guest physical range into the calling process, read-only, and keep it mapped.
 //
 // Resolves each host page frame exactly as VidGetFullVmMemoryBlock does, but builds one
@@ -1071,14 +1268,15 @@ BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULON
 	}
 
 	//
-	// The handle is the caller's, so it is resolved in the caller's mode: a kernel handle or
-	// a handle the caller never opened is refused instead of silently resolved.
+	// KernelMode on purpose, like every other partition lookup in this driver: hvlib hands
+	// over a handle that lives in the VM worker's table, and the PsGetCurrentProcess patch
+	// makes that the table the lookup sees. A UserMode lookup answers STATUS_INVALID_HANDLE.
 	//
 
 	Status = ObReferenceObjectByHandle(Input.PartitionHandle,
-		0,
+		READ_CONTROL,
 		*IoFileObjectType,
-		ExGetPreviousMode(),
+		KernelMode,
 		&objVmPartition,
 		NULL);
 
@@ -1809,11 +2007,23 @@ BOOLEAN VidGetFriendlyPartitionName(PCHAR pBuffer, ULONG len)
 		//
 
 		VidResolveLayout(pPartitionHandle, &Layout);
+		VidFillLayoutReport((PCHAR)pPartitionHandle, &Layout, &g_LastEnumLayout);
 
-		RtlCopyMemory(pBuffer, ((PCHAR)pPartitionHandle + Layout.NameOffset), sizeof(pVmInfo->FriendlyName));
-        RtlCopyMemory(pBuffer+sizeof(pVmInfo->FriendlyName), ((PCHAR)pPartitionHandle + Layout.PartitionIdOffset), sizeof(pVmInfo->PartitionId));
+		//
+		// The reply shares the buffer with the request, and hvlib reads more of it than this
+		// driver fills. Clear it all first so nothing from the pool reaches user mode.
+		//
+
+		if (len < sizeof(VID_VM_INFO)) {
+			KDbgPrintString("VidGetFriendlyPartitionName: output buffer too small");
+			ObDereferenceObject(objVmPartition);
+			return FALSE;
+		}
+		RtlZeroMemory(pBuffer, len);
 
 		pVmInfo = (PVID_VM_INFO)pBuffer;
+		RtlCopyMemory(pVmInfo->FriendlyName, ((PCHAR)pPartitionHandle + Layout.NameOffset), VID_PARTITION_NAME_BYTES_IN_CONTEXT);
+		RtlCopyMemory(&pVmInfo->PartitionId, ((PCHAR)pPartitionHandle + Layout.PartitionIdOffset), sizeof(pVmInfo->PartitionId));
 
 		if (Layout.IsFullVm)
 		{

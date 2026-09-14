@@ -44,6 +44,7 @@ extern "C" {
 #define HVMM_IOCTL_QUERY_MAPPING_SUPPORT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A0, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define HVMM_IOCTL_MAP_GPA_RANGE         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define HVMM_IOCTL_UNMAP_GPA_RANGE       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define HVMM_IOCTL_QUERY_PARTITION_LAYOUT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define HVMM_MAPPING_QUERY_MAGIC   (0x714D7648UL)   // "HvMq"
 #define HVMM_MAPPING_SIGNATURE     (0x704D7648UL)   // "HvMp"
@@ -83,6 +84,78 @@ typedef struct _HVMM_MAP_GPA_RANGE_OUTPUT {
 typedef struct _HVMM_UNMAP_GPA_RANGE_INPUT {
 	PVOID UserVa;
 } HVMM_UNMAP_GPA_RANGE_INPUT, *PHVMM_UNMAP_GPA_RANGE_INPUT;
+
+//
+// What the driver's layout scan found for one partition (HVMM_IOCTL_QUERY_PARTITION_LAYOUT).
+// Diagnostic: print it when a VM lists with no id or type.
+//
+
+#define HVMM_SCAN_NAME        0x01
+#define HVMM_SCAN_GPAR        0x02
+#define HVMM_SCAN_OBJMBLOCK   0x04
+#define HVMM_SCAN_GPA_ARRAY   0x08
+#define HVMM_SCAN_MBLOCKARRAY 0x10
+#define HVMM_SCAN_CACHED      0x20
+
+#define HVMM_IOCTL_STAT_SLOTS 24
+
+typedef struct _HVMM_IOCTL_STAT {
+	UINT32 Code;
+	UINT32 Calls;
+	UINT32 Failures;
+	UINT32 LastStatus;
+} HVMM_IOCTL_STAT, *PHVMM_IOCTL_STAT;
+
+typedef struct _HVMM_PARTITION_LAYOUT_QUERY_INPUT {
+	HANDLE PartitionHandle;
+} HVMM_PARTITION_LAYOUT_QUERY_INPUT, *PHVMM_PARTITION_LAYOUT_QUERY_INPUT;
+
+//
+// Where the last failed IOCTL_VID_INTERNAL_READ_MEMORY gave up. Diagnostic only.
+//
+
+#define HVMM_READ_FAIL_HANDLE       1   // partition handle did not resolve
+#define HVMM_READ_FAIL_NO_CONTEXT   2   // file object has no partition context
+#define HVMM_READ_FAIL_NOT_FULL_VM  3   // layout scan says not a full VM and VmType is unknown
+#define HVMM_READ_FAIL_LENGTH       4   // output length not page aligned
+#define HVMM_READ_FAIL_NO_GPAR      5   // a page is outside every GPA range
+#define HVMM_READ_FAIL_VMWP_RANGE   6   // a page sits in a vmwp.exe descriptor
+#define HVMM_READ_FAIL_NO_MBLOCK    7   // objMBlock is NULL
+#define HVMM_READ_FAIL_NO_ARRAY     8   // host-PFN array is NULL
+#define HVMM_READ_FAIL_MDL          9   // IoAllocateMdl failed
+#define HVMM_READ_FAIL_MAP          10  // MmMapLockedPagesSpecifyCache failed
+#define HVMM_READ_FAIL_EXCEPTION    11  // the copy faulted
+#define HVMM_READ_FAIL_ALL_UNBACKED 12  // no page of the block was host backed
+
+typedef struct _HVMM_LAST_READ_FAIL {
+	UINT64 Handle;
+	UINT64 Gpa;          // bytes, as the caller asked
+	UINT32 Length;       // output buffer length
+	UINT32 Step;         // HVMM_READ_FAIL_*
+	UINT64 FailPage;     // first page number the walk could not back
+	UINT32 Backed;       // pages copied in that request
+	UINT32 Unbacked;     // pages left zero in that request
+	UINT8  Raw[64];      // first bytes of the request buffer, as the caller sent them
+} HVMM_LAST_READ_FAIL, *PHVMM_LAST_READ_FAIL;
+
+typedef struct _HVMM_PARTITION_LAYOUT {
+	UINT32 Signature;
+	UINT32 ScanFlags;
+	UINT32 IsFullVm;
+	UINT32 UsrVmType;
+	UINT32 NameOffset;
+	UINT32 PartitionIdOffset;
+	UINT32 MblockArrayOffset;
+	UINT32 GparHandleOffset;
+	UINT32 GparCountOffset;
+	UINT32 ObjMblockOffset;
+	UINT32 GuestGpaArrayOffset;
+	UINT32 Source;      // 0 = the handle given, 1 = the driver's last enumeration, 2 = handle refused (PartitionId holds the NTSTATUS)
+	UINT64 PartitionId;
+
+	HVMM_IOCTL_STAT IoctlStats[HVMM_IOCTL_STAT_SLOTS];   // every request code the driver has seen since load
+	HVMM_LAST_READ_FAIL LastReadFail;                    // where the last failed classic read gave up
+} HVMM_PARTITION_LAYOUT, *PHVMM_PARTITION_LAYOUT;
 
 //
 // One guest physical run as reported by hvlib (InfoRun), in bytes.
@@ -181,6 +254,7 @@ BOOLEAN HvmmMappedReadPhysicalMemory(_In_ ULONG64 PartitionHandle, _In_ UINT64 S
 //
 
 BOOLEAN HvmmQueryMappingSupport(_In_ HANDLE DeviceHandle, _Out_opt_ PUINT64 MaxMapLength);
+BOOLEAN HvmmQueryPartitionLayout(_In_ HANDLE DeviceHandle, _In_ HANDLE VidPartitionHandle, _Out_ PHVMM_PARTITION_LAYOUT Layout);
 BOOLEAN HvmmMapGpaRange(_In_ HANDLE DeviceHandle, _In_ HANDLE VidPartitionHandle, _In_ UINT64 GpaStart, _In_ UINT64 Length, _Out_ PVOID *UserVa, _Out_ PUINT64 MappedBytes);
 BOOLEAN HvmmUnmapGpaRange(_In_ HANDLE DeviceHandle, _In_ PVOID UserVa);
 

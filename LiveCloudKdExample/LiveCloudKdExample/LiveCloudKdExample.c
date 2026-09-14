@@ -132,6 +132,17 @@ Exit:
 }
 
 
+int g_AutoVmId = -1;
+int g_AutoActionId = -1;
+
+int DemoReadKey(int AutoAnswer)
+{
+	if (g_AutoActionId >= 0) {
+		return AutoAnswer;
+	}
+	return _getch();
+}
+
 BOOLEAN Demo2()
 {
 	PULONG64 Partitions;
@@ -194,7 +205,7 @@ BOOLEAN Demo2()
 		wprintf(L"\n"
 			L"   Please select the ID of the virtual machine you want to play with\n"
 			L"   > ");
-		VmId = _getch();
+		VmId = DemoReadKey('0' + g_AutoVmId);
 	}
 
 	VmId = VmId - 0x30;
@@ -216,6 +227,11 @@ BOOLEAN Demo2()
 		L"   Action List (enter 1 for demo):\n");
 	wprintf(L"    --> [1] Linear physical memory dump\n"); // Enter 1 for testing purposes. Save path looks like C:\Distr\Test\Example\test.raw
 	wprintf(L"    --> [2] Mapped memory: verify and benchmark (needs hvmm.sys with IOCTL_MAP_GPA_RANGE)\n");
+
+	if (g_AutoActionId >= 0)
+	{
+		Action = g_AutoActionId;
+	}
 
 	if (Action == -1)
 	{
@@ -257,6 +273,15 @@ BOOLEAN Demo2()
 	}
 
 	g_CurrentPartitionIntHandle = Partitions[VmId];
+
+	if (ActionId == 2)
+	{
+		//
+		// Before anything that needs the partition to be readable: say what the driver's
+		// layout scan found, so a VM that lists with no id or type explains itself.
+		//
+		MappedMemoryLayoutReport(g_CurrentPartitionIntHandle);
+	}
 
 	if (!SdkSelectPartition(g_CurrentPartitionIntHandle))
 	{
@@ -387,14 +412,23 @@ BOOLEAN Demo2()
 
 
 
-int main()
+int main(int argc, char* argv[])
 {
 	//
 	//Demo1 uses full PHVMM_PARTITION structure for working with partition. 
 	//Demo2 using more simple HANDLE for using with non-C languages.
 	//
-	
+
+	if (argc >= 3) {
+		g_AutoVmId = atoi(argv[1]);
+		g_AutoActionId = atoi(argv[2]);
+	}
+
 	//Demo1(); 
 	Demo2(); 
-	getchar();
+
+	if (g_AutoActionId < 0) {
+		getchar();
+	}
+	return 0;
 }

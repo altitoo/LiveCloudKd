@@ -31,7 +31,15 @@
 //#define VID_PS_PROCESS_CHECK_02 0x16847
 
 
-#define VID_PARTITION_FRIENDLY_NAME_MAX (256)
+//
+// hvlib.dll reads the enumeration reply (VID_VM_INFO) with a 512-character name: PartitionId
+// at +0x400 and VmType at +0x408, in a 0x610-byte buffer. With 256 here the driver wrote them
+// at +0x200 and hvlib saw id 0 and an unknown type. vid.sys itself keeps the name in 0x200
+// bytes (PartitionId follows at name+0x200), so only that much is copied; the rest is zero.
+//
+
+#define VID_PARTITION_FRIENDLY_NAME_MAX (512)
+#define VID_PARTITION_NAME_BYTES_IN_CONTEXT (0x200)
 #define VID_READ_WRITE_GPA_BUFFER_SIZE 0x10
 
 //
@@ -103,6 +111,8 @@
 	FILE_DEVICE_UNKNOWN, 0x8A1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_UNMAP_GPA_RANGE CTL_CODE(\
 	FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_QUERY_PARTITION_LAYOUT CTL_CODE(\
+	FILE_DEVICE_UNKNOWN, 0x8A3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define HVMM_MAPPING_QUERY_MAGIC   (0x714D7648UL)   // "HvMq"
 #define HVMM_MAPPING_SIGNATURE     (0x704D7648UL)   // "HvMp"
@@ -157,11 +167,23 @@ typedef enum _USR_VM_TYPE {
 //
 // Structures for usermode\kernelmode exchange
 //
+
+//
+// The read and write requests (IOCTL_HV_READ_GPA, IOCTL_HV_WRITE_GPA,
+// IOCTL_VID_INTERNAL_READ_MEMORY) as hvlib.dll sends them: handle first, then the
+// partition id, the VM worker process id, two words hvlib leaves zero, then the byte
+// position and the byte count. The older layout (id, position, count, handle) made
+// the driver read handle 0 and position 2 from a real hvlib request, so every read
+// through hvlib failed while a hand-built request worked.
+//
 typedef struct _GPA_INFO {
-    ULONG64 PartitionId;
-    ULONG64 StartPage;// Position in Bytes
-    ULONG64 BytesCount; // now in bytes
-	HANDLE PartitionHandle;
+	HANDLE PartitionHandle;    // +0x00
+	ULONG64 PartitionId;       // +0x08
+	ULONG64 VmwpProcessId;     // +0x10, not used by the driver
+	ULONG64 Reserved18;        // +0x18
+	ULONG64 Reserved20;        // +0x20
+	ULONG64 StartPage;         // +0x28, position in bytes
+	ULONG64 BytesCount;        // +0x30, bytes
 } GPA_INFO, *PGPA_INFO;
 
 
@@ -247,6 +269,82 @@ typedef struct _MAPPING_QUERY_OUTPUT {
 	UINT32 Version;
 	UINT64 MaxMapLength;
 } MAPPING_QUERY_OUTPUT, *PMAPPING_QUERY_OUTPUT;
+
+//
+// IOCTL_QUERY_PARTITION_LAYOUT: what the layout scan found for one partition. A support
+// tool prints it when a VM lists with no id or type, so the failing step has a name.
+//
+
+#define VID_SCAN_NAME        0x01   // FriendlyName and PartitionId found
+#define VID_SCAN_GPAR        0x02   // GPAR block handle found
+#define VID_SCAN_OBJMBLOCK   0x04   // MEMORY_BLOCK pointer inside a GPAR found
+#define VID_SCAN_GPA_ARRAY   0x08   // host-PFN array inside a MEMORY_BLOCK found
+#define VID_SCAN_MBLOCKARRAY 0x10   // MEMORY_BLOCK_ARRAY pointer found (diagnostic paths only)
+#define VID_SCAN_CACHED      0x20   // answered from the cached layout, no scan this time
+
+//
+// Per request-code counters, so a client can see which requests a caller sends and which
+// ones fail. Diagnostic only.
+//
+
+#define HVMM_IOCTL_STAT_SLOTS 24
+
+typedef struct _HVMM_IOCTL_STAT {
+	UINT32 Code;
+	UINT32 Calls;
+	UINT32 Failures;             // completed with an error status, or with no bytes
+	UINT32 LastStatus;
+} HVMM_IOCTL_STAT, *PHVMM_IOCTL_STAT;
+
+//
+// Where the last failed IOCTL_VID_INTERNAL_READ_MEMORY gave up. Diagnostic only.
+//
+
+#define HVMM_READ_FAIL_HANDLE       1   // partition handle did not resolve
+#define HVMM_READ_FAIL_NO_CONTEXT   2   // file object has no partition context
+#define HVMM_READ_FAIL_NOT_FULL_VM  3   // layout scan says not a full VM and VmType is unknown
+#define HVMM_READ_FAIL_LENGTH       4   // output length not page aligned
+#define HVMM_READ_FAIL_NO_GPAR      5   // a page is outside every GPA range
+#define HVMM_READ_FAIL_VMWP_RANGE   6   // a page sits in a vmwp.exe descriptor
+#define HVMM_READ_FAIL_NO_MBLOCK    7   // objMBlock is NULL
+#define HVMM_READ_FAIL_NO_ARRAY     8   // host-PFN array is NULL
+#define HVMM_READ_FAIL_MDL          9   // IoAllocateMdl failed
+#define HVMM_READ_FAIL_MAP          10  // MmMapLockedPagesSpecifyCache failed
+#define HVMM_READ_FAIL_EXCEPTION    11  // the copy faulted
+#define HVMM_READ_FAIL_ALL_UNBACKED 12  // no page of the block was host backed
+
+typedef struct _HVMM_LAST_READ_FAIL {
+	UINT64 Handle;
+	UINT64 Gpa;          // bytes, as the caller asked
+	UINT32 Length;       // output buffer length
+	UINT32 Step;         // HVMM_READ_FAIL_*
+	UINT64 FailPage;     // first page number the walk could not back
+	UINT32 Backed;       // pages copied in that request
+	UINT32 Unbacked;     // pages left zero in that request
+	UINT8  Raw[64];      // first bytes of the request buffer, as the caller sent them
+} HVMM_LAST_READ_FAIL, *PHVMM_LAST_READ_FAIL;
+
+typedef struct _PARTITION_LAYOUT_QUERY_INPUT {
+	HANDLE PartitionHandle;
+} PARTITION_LAYOUT_QUERY_INPUT, *PPARTITION_LAYOUT_QUERY_INPUT;
+
+typedef struct _PARTITION_LAYOUT_QUERY_OUTPUT {
+	UINT32 Signature;            // first 4 bytes of the partition context ("Prtn" expected)
+	UINT32 ScanFlags;            // VID_SCAN_* bits
+	UINT32 IsFullVm;
+	UINT32 UsrVmType;
+	UINT32 NameOffset;
+	UINT32 PartitionIdOffset;
+	UINT32 MblockArrayOffset;
+	UINT32 GparHandleOffset;
+	UINT32 GparCountOffset;
+	UINT32 ObjMblockOffset;
+	UINT32 GuestGpaArrayOffset;
+	UINT32 Source;               // 0 = this handle, 1 = last enumeration (no handle given), 2 = handle refused (PartitionId holds the NTSTATUS)
+	UINT64 PartitionId;          // read at PartitionIdOffset
+	HVMM_IOCTL_STAT IoctlStats[HVMM_IOCTL_STAT_SLOTS]; // every request code seen since load, with call and failure counts
+	HVMM_LAST_READ_FAIL LastReadFail;                  // where the last failed classic read gave up
+} PARTITION_LAYOUT_QUERY_OUTPUT, *PPARTITION_LAYOUT_QUERY_OUTPUT;
 
 //
 // One live guest mapping, tracked per open handle to \\.\hvmm.
@@ -349,6 +447,7 @@ typedef struct _VM_LAYOUT {
 	PVOID   Context;             // partition context these offsets were validated against (cache key)
 	BOOLEAN Resolved;            // context is a "Prtn" partition and all required offsets are known
 	BOOLEAN IsFullVm;            // shape is a full, host-page-backed VM (not a container / exo partition)
+	ULONG   ScanFlags;           // VID_SCAN_* bits: which scans found their field
 	ULONG   UsrVmType;           // USR_VM_TYPE reported to user mode (see enum), derived from the shape
 	ULONG   NameOffset;          // FriendlyName (inline UTF-16) inside the context
 	ULONG   PartitionIdOffset;   // HV_PARTITION_ID inside the context (= NameOffset + 0x200)
@@ -412,6 +511,9 @@ PVOID VidPsProcessCheckWorker(PVOID pCurrentProcess, PVOID pRetAddress);
 BOOLEAN VidGetMBlockInfo(PCHAR pBuffer, ULONG len);
 BOOLEAN VidInternalReadMemory(PCHAR pBuffer, ULONG len);
 BOOLEAN VidQueryMappingSupport(PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
+BOOLEAN VidQueryPartitionLayout(PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
+VOID HvmmNoteIoctl(ULONG Code, NTSTATUS Status, ULONG Bytes);
+VOID HvmmCopyIoctlStats(PHVMM_IOCTL_STAT Stats, ULONG Slots);
 BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
 BOOLEAN VidUnmapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen);
 VOID VidCleanupGpaMappings(PFILE_OBJECT FileObject);
