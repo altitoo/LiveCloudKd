@@ -13,6 +13,8 @@ EPROCESS_INTERNALS EprocessInternalData = { 0 };
 
 static VM_LAYOUT g_DiscoveredLayout = { 0 };
 
+static ULONG64 VidHighestHostPfn(VOID);
+
 //
 // The last classic read that failed, for the layout query. Diagnostic only.
 //
@@ -688,17 +690,11 @@ PGPAR_OBJECT VidGetGparObjectForGpa(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LA
 		if (uElement != 0)
 		{
 			objGpar = (PGPAR_OBJECT)uElement;
-			KDbgLog16("pGparElement->GpaIndexStart", objGpar->GpaIndexStart);
-			KDbgLog16("pGparElement->GpaIndexEnd",objGpar->GpaIndexEnd);
 
 			if ((GPA >= objGpar->GpaIndexStart) && (GPA <= objGpar->GpaIndexEnd))
 			{
 				return objGpar;
 			}
-		}
-		else
-		{
-			KDbgLog("\tGpar Element is NULL, i = ", i);
 		}
 	} // end for
 
@@ -797,49 +793,86 @@ BOOLEAN VidGetContainerMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAY
 //Read memory block from FULL VM
 //
 
+//
+// Copy len bytes of guest memory starting at page GPA into pBuffer. Pages are resolved one
+// GPA range at a time and every host-backed run inside the block is mapped with a single
+// MDL, copied and unmapped, so a block costs a handful of kernel mappings instead of one per
+// page. A page the host does not back (a hole between ranges, a vmwp.exe descriptor, a block
+// with no host-PFN array, a frame past host RAM) is left zero and the walk goes on, the way
+// a physical dump expects. The request fails only when no page of it was backed. The first
+// unbacked page is noted for the layout query.
+//
+
+#define VID_CLASSIC_RUN_MAX_PAGES (HVMM_MAP_GPA_MAX_LENGTH / PAGE_SIZE)
+
+static BOOLEAN VidCopyHostRun(PPFN_NUMBER Pfns, ULONG Pages, PCHAR Dest)
+{
+	PMDL pMDL;
+	PVOID Source = NULL;
+	BOOLEAN Ok = FALSE;
+
+	pMDL = IoAllocateMdl(NULL, Pages * PAGE_SIZE, FALSE, FALSE, NULL);
+	if (pMDL == NULL) {
+		g_LastReadFail.Step = HVMM_READ_FAIL_MDL;
+		return FALSE;
+	}
+	RtlCopyMemory(MmGetMdlPfnArray(pMDL), Pfns, Pages * sizeof(PFN_NUMBER));
+	pMDL->MdlFlags |= MDL_PAGES_LOCKED;
+
+	__try {
+		Source = MmMapLockedPagesSpecifyCache(pMDL, KernelMode, MmCached, NULL, FALSE, NormalPagePriority | MdlMappingNoWrite);
+		if (Source != NULL) {
+			RtlCopyMemory(Dest, Source, Pages * PAGE_SIZE);
+			MmUnmapLockedPages(Source, pMDL);
+			Ok = TRUE;
+		}
+		else {
+			g_LastReadFail.Step = HVMM_READ_FAIL_MAP;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		KDbgLog("VidCopyHostRun: copy faulted", GetExceptionCode());
+		g_LastReadFail.Step = HVMM_READ_FAIL_EXCEPTION;
+	}
+
+	pMDL->MdlFlags &= ~MDL_PAGES_LOCKED;
+	IoFreeMdl(pMDL);
+	return Ok;
+}
+
 BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout, PCHAR pBuffer, ULONG len, ULONG64 GPA)
 {
-	PMEMORY_BLOCK objMBlock = NULL;
-	PGPAR_OBJECT objGpar = NULL;
-	PULONG64 pGuestGpaArray = NULL;
-
-	ULONG64 HostSPA = 0;
-
-	PMDL pMDL = NULL;
-	PVOID VirtualAddress = NULL;
-	PULONG64 MdlPfnArray = NULL;
-
-	PVOID SourceAddress = NULL;
-	ULONG64 uBlocks, uRemainBytes, i;
+	PPFN_NUMBER Pfns;
+	ULONG64 TotalPages = len / PAGE_SIZE;
+	ULONG64 i = 0;
+	ULONG64 HighestHostPfn;
 	ULONG Backed = 0, Unbacked = 0;
 
-	//DbgBreakPoint();
-
-	uBlocks = len / PAGE_SIZE;
-	uRemainBytes = len % PAGE_SIZE;
-
-	if (uRemainBytes != 0) {
+	if ((len % PAGE_SIZE) != 0) {
 		KDbgPrintString("Buffer Length must be paged size alignment");
 		g_LastReadFail.Step = HVMM_READ_FAIL_LENGTH;
 		return FALSE;
 	}
 
-	//
-	// A page the host does not back (a hole between GPA ranges, a vmwp.exe descriptor, a
-	// block with no host-PFN array) is left zero and the walk goes on, the way a physical
-	// dump expects. The request fails only when no page of it was backed. The first such
-	// page is noted for the layout query.
-	//
+	HighestHostPfn = VidHighestHostPfn();
+	Pfns = (PPFN_NUMBER)HvmmPoolAlloc(VID_CLASSIC_RUN_MAX_PAGES * sizeof(PFN_NUMBER));
+	if (Pfns == NULL) {
+		g_LastReadFail.Step = HVMM_READ_FAIL_MDL;
+		return FALSE;
+	}
 
-	for (i = 0; i < uBlocks; i++)
-	{
+	while (i < TotalPages) {
+		ULONG64 Page = GPA + i;
+		ULONG64 RangeEnd;
+		PGPAR_OBJECT objGpar;
+		PMEMORY_BLOCK objMBlock = NULL;
+		PULONG64 pGuestGpaArray = NULL;
 		ULONG Step = 0;
+		ULONG Run = 0;
 
-		objGpar = VidGetGparObjectForGpa(pPartitionHandle, pLayout, GPA+i);
+		objGpar = VidGetGparObjectForGpa(pPartitionHandle, pLayout, Page);
 
-		if (objGpar == NULL ||
-			GPA + i < objGpar->GpaIndexStart ||
-			GPA + i > objGpar->GpaIndexEnd) {
+		if (objGpar == NULL || Page < objGpar->GpaIndexStart || Page > objGpar->GpaIndexEnd) {
 			Step = HVMM_READ_FAIL_NO_GPAR;
 		}
 		else if (objGpar->GpaIndexStart == objGpar->GpaIndexEnd) {
@@ -858,55 +891,44 @@ BOOLEAN VidGetFullVmMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT
 			}
 		}
 
+		if (Step == 0) {
+			RangeEnd = objGpar->GpaIndexEnd;
+			if (RangeEnd > GPA + TotalPages - 1) {
+				RangeEnd = GPA + TotalPages - 1;
+			}
+			while (Page + Run <= RangeEnd && Run < VID_CLASSIC_RUN_MAX_PAGES) {
+				ULONG64 HostPfn = *(PULONG)((PCHAR)pGuestGpaArray + 0x10 * (Page + Run - objGpar->GpaIndexStart));
+				if (HostPfn == 0 || HostPfn > HighestHostPfn) {
+					break;
+				}
+				Pfns[Run] = (PFN_NUMBER)HostPfn;
+				Run++;
+			}
+			if (Run == 0) {
+				Step = HVMM_READ_FAIL_NO_GPAR;
+			}
+		}
+
 		if (Step != 0) {
 			if (Unbacked == 0) {
 				g_LastReadFail.Step = Step;
-				g_LastReadFail.FailPage = GPA + i;
+				g_LastReadFail.FailPage = Page;
 			}
 			Unbacked++;
+			i++;
 			continue;
 		}
 
-		HostSPA = *(PULONG)((PCHAR)pGuestGpaArray + 0x10 * (GPA- objGpar->GpaIndexStart +i));
-
-		pMDL = IoAllocateMdl(VirtualAddress, PAGE_SIZE, FALSE, FALSE, NULL);
-
-		if (pMDL == NULL) {
-			KDbgPrintString("MDL allocation false");
-			g_LastReadFail.Step = HVMM_READ_FAIL_MDL;
-			g_LastReadFail.FailPage = GPA + i;
+		if (!VidCopyHostRun(Pfns, Run, pBuffer + i * PAGE_SIZE)) {
+			g_LastReadFail.FailPage = Page;
+			HvmmPoolFree(Pfns);
 			return FALSE;
 		}
-
-		MdlPfnArray = MmGetMdlPfnArray(pMDL);
-		*MdlPfnArray = HostSPA;
-
-		__try
-		{
-			SourceAddress = MmMapLockedPagesSpecifyCache(pMDL, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
-
-			if (!SourceAddress)
-			{
-				IoFreeMdl(pMDL);
-				g_LastReadFail.Step = HVMM_READ_FAIL_MAP;
-				g_LastReadFail.FailPage = GPA + i;
-				return FALSE;
-			}
-
-			RtlCopyMemory(pBuffer + i * PAGE_SIZE, SourceAddress, PAGE_SIZE);
-
-			MmUnmapLockedPages(SourceAddress, pMDL);
-			Backed++;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			KDbgLog("   RtlCopyMemory failed", GetExceptionCode());
-			g_LastReadFail.Step = HVMM_READ_FAIL_EXCEPTION;
-			g_LastReadFail.FailPage = GPA + i;
-		}
-
-		IoFreeMdl(pMDL);
+		Backed += Run;
+		i += Run;
 	}
+
+	HvmmPoolFree(Pfns);
 
 	g_LastReadFail.Backed = Backed;
 	g_LastReadFail.Unbacked = Unbacked;
