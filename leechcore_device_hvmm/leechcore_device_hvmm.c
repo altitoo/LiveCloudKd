@@ -22,6 +22,13 @@
 
 DWORD g_cDeviceHVMM = 0;
 
+/*
+* The guest mapping of the device opened last, for the process that hosts this plugin: the
+* bot reads whole pages straight from it (LcHvmmMappedPointer) instead of asking LeechCore for
+* each one. One VM per process, so one mapping.
+*/
+PHVMM_MAPPED_MEMORY g_MappedForHost = NULL;
+
 
 //-----------------------------------------------------------------------------
 // GENERAL FUNCTIONALITY BELOW:
@@ -75,8 +82,21 @@ static VOID DeviceHVMM_MappedLost(_In_ PLC_CONTEXT ctxLC)
     if (!ctx->Mapped || HvmmMappedIsAlive(ctx->Mapped)) { return; }
 
     lcprintf(ctxLC, "DEVICE_HVMM: the guest mapping is gone (VM stopped?), reads go through the driver from now on.\n");
+    if (g_MappedForHost == ctx->Mapped) { g_MappedForHost = NULL; }
     HvmmMappedClose(ctx->Mapped);
     ctx->Mapped = NULL;
+}
+
+/*
+* Where guest physical address Gpa sits in this process, or NULL when it is not mapped; the
+* bytes readable from there onward in *Available. The pointer reads live guest memory and
+* stays valid while the device is open and the VM runs.
+*/
+EXPORTED_FUNCTION PVOID LcHvmmMappedPointer(_In_ UINT64 Gpa, _Out_opt_ PUINT64 Available)
+{
+    if (Available) { *Available = 0; }
+    if (!g_MappedForHost) { return NULL; }
+    return HvmmMappedGetPointer(g_MappedForHost, Gpa, Available);
 }
 
 VOID DeviceHVMM_ReadScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ PPMEM_SCATTER ppMEMs)
@@ -528,6 +548,7 @@ VOID DeviceHVMM_Close(_Inout_ PLC_CONTEXT ctxLC)
 
         if (ctx->Mapped)
         {
+            if (g_MappedForHost == ctx->Mapped) { g_MappedForHost = NULL; }
             HvmmMappedClose(ctx->Mapped);
             ctx->Mapped = NULL;
         }
