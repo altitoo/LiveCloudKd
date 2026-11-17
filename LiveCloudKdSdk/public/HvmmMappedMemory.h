@@ -17,11 +17,14 @@
 // the map call fails and every read silently falls back, so callers never lose
 // coverage, only speed.
 //
-// A mapping outlives the VM. Nothing pins the guest's host pages: once the VM
-// stops, the host reuses them and the mapping shows whatever lands there. Reads
-// keep succeeding and return wrong bytes. Callers must watch the VM themselves
-// (HvmmMappedIsAlive, or SdkEnumPartitions) and close the context when it is
-// gone. Open and close must not overlap with reads from other threads.
+// Nothing pins the guest's host pages. With hvmm.sys mapping version 2 the driver
+// unmaps a VM's ranges itself when its worker process exits, and HvmmMappedVerify
+// re-checks them on demand (call it about once a second). A read from a range the
+// driver dropped faults; HvmmMappedRead and HvmmMappedCopyOut catch that and
+// answer FALSE, and the caller closes the context and reads through the driver.
+// With a version 1 driver none of this happens and the caller must watch the VM.
+// HvmmMappedReadPhysicalMemory may run on many threads; HvmmMappedClose waits for
+// the reads in flight through it.
 //
 
 #include <windows.h>
@@ -45,10 +48,11 @@ extern "C" {
 #define HVMM_IOCTL_MAP_GPA_RANGE         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define HVMM_IOCTL_UNMAP_GPA_RANGE       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define HVMM_IOCTL_QUERY_PARTITION_LAYOUT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define HVMM_IOCTL_VERIFY_GPA_MAPPINGS   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A4, METHOD_BUFFERED, FILE_ANY_ACCESS)   // mapping version 2
 
 #define HVMM_MAPPING_QUERY_MAGIC   (0x714D7648UL)   // "HvMq"
 #define HVMM_MAPPING_SIGNATURE     (0x704D7648UL)   // "HvMp"
-#define HVMM_MAPPING_VERSION       (1UL)
+#define HVMM_MAPPING_VERSION       (2UL)   // 2: verify request, mappings dropped when the VM worker exits
 
 //
 // The driver reports the largest single map request it accepts in the handshake
@@ -80,6 +84,13 @@ typedef struct _HVMM_MAP_GPA_RANGE_OUTPUT {
 	PVOID UserVa;
 	UINT64 MappedBytes;
 } HVMM_MAP_GPA_RANGE_OUTPUT, *PHVMM_MAP_GPA_RANGE_OUTPUT;
+
+typedef struct _HVMM_VERIFY_GPA_MAPPINGS_OUTPUT {
+	UINT32 Checked;
+	UINT32 Dropped;
+	UINT32 DroppedByExit;
+	UINT32 Reserved;
+} HVMM_VERIFY_GPA_MAPPINGS_OUTPUT, *PHVMM_VERIFY_GPA_MAPPINGS_OUTPUT;
 
 typedef struct _HVMM_UNMAP_GPA_RANGE_INPUT {
 	PVOID UserVa;
@@ -199,6 +210,8 @@ typedef struct _HVMM_MAPPED_MEMORY {
 	UINT64 MappedBytes;             // sum of chunk lengths
 	UINT64 MapCalls;                // IOCTLs issued while opening
 	UINT64 FallbackReads;           // reads (or partial reads) served by hvlib
+	UINT32 DriverVersion;           // HVMM_MAPPING_VERSION the driver answered
+	UINT64 VerifyCalls;             // HvmmMappedVerify requests sent
 } HVMM_MAPPED_MEMORY, *PHVMM_MAPPED_MEMORY;
 
 //
@@ -240,6 +253,21 @@ BOOLEAN HvmmMappedIsAlive(_In_ PHVMM_MAPPED_MEMORY Mapped);
 //
 
 VOID HvmmMappedClose(_In_opt_ PHVMM_MAPPED_MEMORY Mapped);
+
+//
+// Ask the driver to re-check the mappings against the VM (driver mapping version 2). Cheap,
+// meant for about once a second, never per read. FALSE means at least one range is gone or
+// the check failed: close the context and read through the driver.
+//
+
+BOOLEAN HvmmMappedVerify(_In_ PHVMM_MAPPED_MEMORY Mapped);
+
+//
+// Copy Length bytes at Gpa out of the mapping with any fault caught. FALSE when the range is
+// not mapped in one piece, or when the driver has already unmapped it (the VM went away).
+//
+
+BOOLEAN HvmmMappedCopyOut(_In_ PHVMM_MAPPED_MEMORY Mapped, _In_ UINT64 Gpa, _Out_writes_bytes_(Length) PVOID Buffer, _In_ UINT64 Length);
 
 //
 // Drop-in replacement for SdkReadPhysicalMemory. Serves the read from a mapping

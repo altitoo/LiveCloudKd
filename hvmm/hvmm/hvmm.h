@@ -113,10 +113,17 @@
 	FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_QUERY_PARTITION_LAYOUT CTL_CODE(\
 	FILE_DEVICE_UNKNOWN, 0x8A3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_VERIFY_GPA_MAPPINGS CTL_CODE(\
+	FILE_DEVICE_UNKNOWN, 0x8A4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// HVMM_MAPPING_VERSION 2 adds IOCTL_VERIFY_GPA_MAPPINGS and drops mappings by itself when
+// the VM worker process exits. A client checks the version before sending 0x8A4.
+//
 
 #define HVMM_MAPPING_QUERY_MAGIC   (0x714D7648UL)   // "HvMq"
 #define HVMM_MAPPING_SIGNATURE     (0x704D7648UL)   // "HvMp"
-#define HVMM_MAPPING_VERSION       (1UL)
+#define HVMM_MAPPING_VERSION       (2UL)
 
 //
 // One map call never spans more than 8 MB. The limit is the Size field of the MDL, a
@@ -275,6 +282,20 @@ typedef struct _UNMAP_GPA_RANGE_INPUT {
 // Input carries HVMM_MAPPING_QUERY_MAGIC; the driver answers with HVMM_MAPPING_SIGNATURE.
 //
 
+//
+// IOCTL_VERIFY_GPA_MAPPINGS: re-check every mapping of this handle against its partition.
+// A mapping whose VM worker has exited, or whose host frames are no longer the ones the
+// partition maps, is unmapped. Input: any 8 bytes. Output: the counts below. A client calls
+// it now and then (about once a second), never per read.
+//
+
+typedef struct _VERIFY_GPA_MAPPINGS_OUTPUT {
+	UINT32 Checked;              // mappings looked at
+	UINT32 Dropped;              // mappings unmapped by this call
+	UINT32 DroppedByExit;        // mappings unmapped since load because their VM worker exited
+	UINT32 Reserved;
+} VERIFY_GPA_MAPPINGS_OUTPUT, *PVERIFY_GPA_MAPPINGS_OUTPUT;
+
 typedef struct _MAPPING_QUERY_INPUT {
 	UINT32 Magic;
 	UINT32 Reserved;
@@ -374,8 +395,11 @@ typedef struct _HVMM_GPA_MAPPING {
 	LIST_ENTRY Link;
 	PMDL Mdl;
 	PVOID UserVa;
-	PEPROCESS Process;
+	PEPROCESS Process;           // where it is mapped (referenced)
 	UINT64 MappedBytes;
+	UINT64 GpaStartPage;         // first guest page it shows
+	PFILE_OBJECT Partition;      // vid.sys partition it was resolved from (referenced)
+	PEPROCESS Vmwp;              // VM worker that owns the partition, NULL if not found (referenced)
 } HVMM_GPA_MAPPING, *PHVMM_GPA_MAPPING;
 
 //
@@ -384,6 +408,7 @@ typedef struct _HVMM_GPA_MAPPING {
 //
 
 typedef struct _HVMM_FILE_CONTEXT {
+	LIST_ENTRY GlobalLink;       // on MapGuard's list of open handles
 	KSPIN_LOCK Lock;
 	LIST_ENTRY MappingList;
 	ULONG MappingCount;
@@ -537,6 +562,19 @@ VOID HvmmCopyIoctlStats(PHVMM_IOCTL_STAT Stats, ULONG Slots);
 BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULONG outLen, PULONG pBytesReturned);
 BOOLEAN VidUnmapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen);
 VOID VidCleanupGpaMappings(PFILE_OBJECT FileObject);
+VOID VidReleaseGpaMapping(PHVMM_GPA_MAPPING pMapping);
+
+//
+// mapguard.c
+//
+
+NTSTATUS MapGuardInit(VOID);
+VOID MapGuardUnload(VOID);
+VOID MapGuardRegisterContext(PHVMM_FILE_CONTEXT pFileContext);
+VOID MapGuardUnregisterContext(PHVMM_FILE_CONTEXT pFileContext);
+PEPROCESS MapGuardFindVmwp(PFILE_OBJECT Partition);
+BOOLEAN MapGuardIsHostRam(ULONG64 Pfn);
+NTSTATUS MapGuardVerify(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG outLen, PULONG pBytesReturned);
 BOOLEAN VidResolveLayout(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout);
 PGPAR_OBJECT VidGetGparObjectForGpa(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout, UINT64 GPA);
 BOOLEAN VidGetContainerMemoryBlock(PVM_PROCESS_CONTEXT pPartitionHandle, PVM_LAYOUT pLayout, PCHAR pBuffer, ULONG len, ULONG64 GPA);

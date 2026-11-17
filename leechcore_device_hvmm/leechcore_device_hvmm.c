@@ -71,32 +71,125 @@ VOID DeviceHVMM_WriteScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ 
 }
 
 /*
-* A read through the mapping failed. That happens when the VM went away and the
-* pages are gone; drop the mapping so every later read takes the driver path,
-* which reports the real state of the partition.
+* The mapping is shared by every thread that reads (LeechCore's scatter reads and the host's
+* LcHvmmMappedCopy). Readers hold g_MappedLock shared; dropping the mapping takes it exclusive,
+* so it is never closed under a copy. One VM per process, so one mapping and one context.
 */
-static VOID DeviceHVMM_MappedLost(_In_ PLC_CONTEXT ctxLC)
+static SRWLOCK g_MappedLock = SRWLOCK_INIT;
+static PDEVICE_CONTEXT_HVMM g_MappedCtx = NULL;
+static volatile LONG64 g_MappedLastVerify = 0;
+static volatile LONG g_MappedLostFlag = 0;
+
+#define HVMM_MAPPED_VERIFY_INTERVAL_MS 1000
+
+VOID DeviceHVMM_MappedAttach(_In_ PDEVICE_CONTEXT_HVMM ctx)
 {
-    PDEVICE_CONTEXT_HVMM ctx = (PDEVICE_CONTEXT_HVMM)ctxLC->hDevice;
+    AcquireSRWLockExclusive(&g_MappedLock);
+    g_MappedCtx = ctx;
+    g_MappedForHost = ctx->Mapped;
+    g_MappedLastVerify = (LONG64)GetTickCount64();
+    g_MappedLostFlag = 0;
+    ReleaseSRWLockExclusive(&g_MappedLock);
+}
 
-    if (!ctx->Mapped || HvmmMappedIsAlive(ctx->Mapped)) { return; }
+/*
+* Close the mapping: every later read takes the driver path, which reports the real state of
+* the partition. Called when the driver says a range is gone, or when a copy faulted because
+* the driver already unmapped it (the VM stopped).
+*/
+static VOID DeviceHVMM_MappedDrop(_In_opt_ PLC_CONTEXT ctxLC)
+{
+    PHVMM_MAPPED_MEMORY Mapped = NULL;
 
-    lcprintf(ctxLC, "DEVICE_HVMM: the guest mapping is gone (VM stopped?), reads go through the driver from now on.\n");
-    if (g_MappedForHost == ctx->Mapped) { g_MappedForHost = NULL; }
-    HvmmMappedClose(ctx->Mapped);
-    ctx->Mapped = NULL;
+    AcquireSRWLockExclusive(&g_MappedLock);
+    if (g_MappedCtx && g_MappedCtx->Mapped) {
+        Mapped = g_MappedCtx->Mapped;
+        g_MappedCtx->Mapped = NULL;
+    }
+    g_MappedForHost = NULL;
+    if (Mapped) {
+        HvmmMappedClose(Mapped);
+    }
+    ReleaseSRWLockExclusive(&g_MappedLock);
+
+    if (Mapped && ctxLC) {
+        lcprintf(ctxLC, "DEVICE_HVMM: the guest mapping is gone (VM stopped or memory changed), reads go through the driver from now on.\n");
+    }
+}
+
+/*
+* About once a second, ask the driver whether the mapping still shows the VM's memory. One
+* thread does it; the others carry on. Caller holds g_MappedLock shared.
+*/
+static VOID DeviceHVMM_MappedMaybeVerify(VOID)
+{
+    LONG64 Now = (LONG64)GetTickCount64();
+    LONG64 Last = g_MappedLastVerify;
+
+    if (!g_MappedForHost || Now - Last < HVMM_MAPPED_VERIFY_INTERVAL_MS) { return; }
+    if (InterlockedCompareExchange64(&g_MappedLastVerify, Now, Last) != Last) { return; }
+    if (!HvmmMappedVerify(g_MappedForHost)) {
+        InterlockedExchange(&g_MappedLostFlag, 1);
+    }
+}
+
+/*
+* Drop the mapping if a check said so. Caller holds no lock.
+*/
+static VOID DeviceHVMM_MappedDropIfLost(_In_opt_ PLC_CONTEXT ctxLC)
+{
+    if (InterlockedExchange(&g_MappedLostFlag, 0)) {
+        DeviceHVMM_MappedDrop(ctxLC);
+    }
 }
 
 /*
 * Where guest physical address Gpa sits in this process, or NULL when it is not mapped; the
-* bytes readable from there onward in *Available. The pointer reads live guest memory and
-* stays valid while the device is open and the VM runs.
+* bytes readable from there onward in *Available. Unsafe: the driver unmaps the range when the
+* VM stops, and a read through this pointer then faults. Use LcHvmmMappedCopy.
 */
 EXPORTED_FUNCTION PVOID LcHvmmMappedPointer(_In_ UINT64 Gpa, _Out_opt_ PUINT64 Available)
 {
+    PVOID p = NULL;
+
     if (Available) { *Available = 0; }
-    if (!g_MappedForHost) { return NULL; }
-    return HvmmMappedGetPointer(g_MappedForHost, Gpa, Available);
+    AcquireSRWLockShared(&g_MappedLock);
+    if (g_MappedForHost) {
+        p = HvmmMappedGetPointer(g_MappedForHost, Gpa, Available);
+    }
+    ReleaseSRWLockShared(&g_MappedLock);
+    return p;
+}
+
+/*
+* Copy Size bytes at guest physical address Gpa from the mapping into Buffer. TRUE only when
+* all of them came from the mapping. FALSE when the range is not mapped in one piece, or when
+* the VM went away (the copy faulted, or the driver's periodic check said so); the mapping is
+* then dropped and the caller reads through LeechCore instead.
+*/
+EXPORTED_FUNCTION BOOL LcHvmmMappedCopy(_In_ UINT64 Gpa, _Out_writes_bytes_(Size) PVOID Buffer, _In_ UINT64 Size)
+{
+    BOOL Ok = FALSE;
+    BOOL Fault = FALSE;
+
+    AcquireSRWLockShared(&g_MappedLock);
+    if (g_MappedForHost) {
+        DeviceHVMM_MappedMaybeVerify();
+        if (!g_MappedLostFlag) {
+            PVOID p = HvmmMappedGetPointer(g_MappedForHost, Gpa, NULL);
+            if (p) {
+                Ok = HvmmMappedCopyOut(g_MappedForHost, Gpa, Buffer, Size);
+                Fault = !Ok && HvmmMappedGetPointer(g_MappedForHost, Gpa + Size - 1, NULL) != NULL;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_MappedLock);
+
+    if (Fault) {
+        InterlockedExchange(&g_MappedLostFlag, 1);
+    }
+    DeviceHVMM_MappedDropIfLost(NULL);
+    return Ok;
 }
 
 VOID DeviceHVMM_ReadScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ PPMEM_SCATTER ppMEMs)
@@ -105,14 +198,29 @@ VOID DeviceHVMM_ReadScatter(_In_ PLC_CONTEXT ctxLC, _In_ DWORD cpMEMs, _Inout_ P
     DWORD i;
     PMEM_SCATTER pMEM;
 
+    AcquireSRWLockShared(&g_MappedLock);
+    if (ctx->Mapped) {
+        DeviceHVMM_MappedMaybeVerify();
+        for (i = 0; i < cpMEMs && !g_MappedLostFlag; i++) {
+            pMEM = ppMEMs[i];
+            if (pMEM->f || MEM_SCATTER_ADDR_ISINVALID(pMEM)) { continue; }
+            pMEM->f = HvmmMappedRead(ctx->Mapped, pMEM->qwA, pMEM->pb, pMEM->cb);
+            //
+            // A failure inside a mapped chunk is a fault: the driver may have dropped it. A
+            // failure in a gap is only the fallback read failing, which says nothing about it.
+            //
+            if (!pMEM->f && HvmmMappedGetPointer(ctx->Mapped, pMEM->qwA, NULL) && !HvmmMappedVerify(ctx->Mapped)) {
+                InterlockedExchange(&g_MappedLostFlag, 1);
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_MappedLock);
+    DeviceHVMM_MappedDropIfLost(ctxLC);
+
     for (i = 0; i < cpMEMs; i++) {
         pMEM = ppMEMs[i];
         if (pMEM->f || MEM_SCATTER_ADDR_ISINVALID(pMEM)) { continue; }
 
-        if (ctx->Mapped) {
-            pMEM->f = HvmmMappedRead(ctx->Mapped, pMEM->qwA, pMEM->pb, pMEM->cb);
-            if (!pMEM->f) { DeviceHVMM_MappedLost(ctxLC); }
-        }
         if (!pMEM->f) {
             pMEM->f = HVMM_ReadFile(ctx->Partition, pMEM->qwA, pMEM->pb, pMEM->cb);
         }
@@ -546,12 +654,10 @@ VOID DeviceHVMM_Close(_Inout_ PLC_CONTEXT ctxLC)
     {
         fKeepDriver = ctx->KeepDriver;
 
-        if (ctx->Mapped)
-        {
-            if (g_MappedForHost == ctx->Mapped) { g_MappedForHost = NULL; }
-            HvmmMappedClose(ctx->Mapped);
-            ctx->Mapped = NULL;
-        }
+        DeviceHVMM_MappedDrop(NULL);
+        AcquireSRWLockExclusive(&g_MappedLock);
+        g_MappedCtx = NULL;
+        ReleaseSRWLockExclusive(&g_MappedLock);
 
         SdkClosePartition((ULONG64)ctx->Partition);
 

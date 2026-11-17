@@ -14,6 +14,7 @@
 
 #include "leechcore_device_hvmm.h"
 extern PHVMM_MAPPED_MEMORY g_MappedForHost;
+VOID DeviceHVMM_MappedAttach(_In_ PDEVICE_CONTEXT_HVMM ctx);
 
 READ_MEMORY_METHOD g_MemoryReadInterfaceType = ReadInterfaceHvmmDrvInternal;
 WRITE_MEMORY_METHOD g_MemoryWriteInterfaceType = WriteInterfaceHvmmDrvInternal;
@@ -258,7 +259,7 @@ BOOL HVMMStart(_Inout_ PLC_CONTEXT ctxLC)
 
 		if (HvmmMappedOpen(ctx->Partition, DeviceHandle, &ctx->Mapped))
 		{
-			g_MappedForHost = ctx->Mapped;
+			DeviceHVMM_MappedAttach(ctx);
 			lcprintf(ctxLC, "DEVICE_HVMM: guest memory mapped read-only: %llu MB of %llu MB in %lu chunks.\n",
 				ctx->Mapped->MappedBytes >> 20, ctx->Mapped->RunBytes >> 20, ctx->Mapped->ChunkCount);
 		}

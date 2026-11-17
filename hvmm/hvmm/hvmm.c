@@ -78,6 +78,14 @@ NTSTATUS DriverEntry( IN PDRIVER_OBJECT DriverObject,
     DriverObject->MajorFunction[IRP_MJ_READ] = ReadWrite_IRPhandler;
     DriverObject->MajorFunction[IRP_MJ_WRITE] = ReadWrite_IRPhandler;
 
+	//
+	// The mapping guard (mapguard.c) must be ready before the first handle opens. If the
+	// process-exit notification cannot be registered the driver still loads; mappings are then
+	// only checked by IOCTL_VERIFY_GPA_MAPPINGS.
+	//
+
+	MapGuardInit();
+
 	RtlInitUnicodeString( &devName, L"\\Device\\hvmm" );
 	RtlInitUnicodeString(&DeviceSDDLString, DEVICE_SDDL);
 
@@ -91,7 +99,10 @@ NTSTATUS DriverEntry( IN PDRIVER_OBJECT DriverObject,
 							NULL,
                             &fdo);
 
-	if(!NT_SUCCESS(status)) return status;
+	if(!NT_SUCCESS(status)) {
+		MapGuardUnload();
+		return status;
+	}
 
 	dx = (PHVMM_DEVICE_EXTENSION)fdo->DeviceExtension;
 	dx->fdo = fdo;  
@@ -106,6 +117,7 @@ NTSTATUS DriverEntry( IN PDRIVER_OBJECT DriverObject,
 	{ 
 		KDbgLog("Error IoCreateSymbolicLink", status);
         IoDeleteDevice( fdo );
+		MapGuardUnload();
 		return status;
     } 
 	KDbgPrintString("hvmm was loaded succesfully");
@@ -140,11 +152,13 @@ NTSTATUS Create_File_IRPprocessing(IN PDEVICE_OBJECT fdo,IN PIRP Irp)
 
 	if (IrpStack->FileObject != NULL) {
 		PHVMM_FILE_CONTEXT pFileContext = (PHVMM_FILE_CONTEXT)HvmmPoolAlloc(sizeof(HVMM_FILE_CONTEXT));
-		if (pFileContext != NULL) {
-			KeInitializeSpinLock(&pFileContext->Lock);
-			InitializeListHead(&pFileContext->MappingList);
-			IrpStack->FileObject->FsContext2 = pFileContext;
+		if (pFileContext == NULL) {
+			return CompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
 		}
+		KeInitializeSpinLock(&pFileContext->Lock);
+		InitializeListHead(&pFileContext->MappingList);
+		MapGuardRegisterContext(pFileContext);
+		IrpStack->FileObject->FsContext2 = pFileContext;
 	}
 
 	return CompleteIrp(Irp,STATUS_SUCCESS,0);
@@ -172,6 +186,7 @@ NTSTATUS Close_HandleIRPprocessing(IN PDEVICE_OBJECT fdo,IN PIRP Irp)
 		// Cleanup already unmapped everything; free the list context and drop the pointer.
 		//
 		VidCleanupGpaMappings(IrpStack->FileObject);
+		MapGuardUnregisterContext((PHVMM_FILE_CONTEXT)IrpStack->FileObject->FsContext2);
 		HvmmPoolFree(IrpStack->FileObject->FsContext2);
 		IrpStack->FileObject->FsContext2 = NULL;
 	}
@@ -402,6 +417,11 @@ NTSTATUS DeviceControlRoutine( IN PDEVICE_OBJECT fdo, IN PIRP Irp )
 		}
 		break;
 	}
+	case IOCTL_VERIFY_GPA_MAPPINGS:
+	{
+		status = MapGuardVerify(IrpStack->FileObject, pInputBuffer, uOutBufLen, &BytesTxd);
+		break;
+	}
 	case IOCTL_UNMAP_GPA_RANGE:
 	{
 		if (VidUnmapGpaRange(IrpStack->FileObject, pInputBuffer, uInputBufLen) == TRUE) {
@@ -430,7 +450,8 @@ VOID UnloadRoutine(IN PDRIVER_OBJECT pDriverObject)
 	int i;
 
 	VidRestorePsGetCurrentProcess();
-        
+	MapGuardUnload();
+
 	pNextDevObj = pDriverObject->DeviceObject;
 
 	for(i=0; pNextDevObj!=NULL; i++)

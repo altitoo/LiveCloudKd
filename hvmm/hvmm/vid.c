@@ -1140,7 +1140,7 @@ static ULONG64 VidHighestHostPfn(VOID)
 // The mapping holds a reference on its owner, so the pointer is never a reused one.
 //
 
-static VOID VidReleaseGpaMapping(PHVMM_GPA_MAPPING pMapping)
+VOID VidReleaseGpaMapping(PHVMM_GPA_MAPPING pMapping)
 {
 	PEPROCESS Owner = pMapping->Process;
 	BOOLEAN Attached = FALSE;
@@ -1165,6 +1165,12 @@ static VOID VidReleaseGpaMapping(PHVMM_GPA_MAPPING pMapping)
 
 	pMapping->Mdl->MdlFlags &= ~MDL_PAGES_LOCKED;
 	IoFreeMdl(pMapping->Mdl);
+	if (pMapping->Partition != NULL) {
+		ObDereferenceObject(pMapping->Partition);
+	}
+	if (pMapping->Vmwp != NULL) {
+		ObDereferenceObject(pMapping->Vmwp);
+	}
 	ObDereferenceObject(pMapping->Process);
 	HvmmPoolFree(pMapping);
 }
@@ -1395,12 +1401,14 @@ BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULON
 			}
 
 			//
-			// A frame past host RAM is treated like an unbacked page: it ends the prefix.
+			// A frame outside every host RAM range (past the end, or in a gap such as the
+			// PCI hole) is treated like an unbacked page: it ends the prefix, so device
+			// memory is never mapped cached.
 			//
 
 			for (; GpaPage <= RangeEnd; GpaPage++, i++) {
 				ULONG64 HostPfn = *(PULONG)((PCHAR)pGuestGpaArray + 0x10 * (GpaPage - objGpar->GpaIndexStart));
-				if (HostPfn == 0 || HostPfn > HighestHostPfn) {
+				if (HostPfn == 0 || HostPfn > HighestHostPfn || !MapGuardIsHostRam(HostPfn)) {
 					Unbacked = TRUE;
 					break;
 				}
@@ -1454,14 +1462,24 @@ BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULON
 	pMapping->UserVa = UserVa;
 	pMapping->Process = PsGetThreadProcess(PsGetCurrentThread());
 	pMapping->MappedBytes = MappedBytes;
+	pMapping->GpaStartPage = GpaStartPage;
 	ObReferenceObject(pMapping->Process);
+
+	//
+	// The mapping keeps the partition object and the VM worker process it belongs to.
+	// MapGuard drops it when that worker exits, and IOCTL_VERIFY_GPA_MAPPINGS re-checks its
+	// frames against the partition. Both references are released with the mapping.
+	//
+
+	pMapping->Partition = objVmPartition;
+	objVmPartition = NULL;
+	pMapping->Vmwp = MapGuardFindVmwp(pMapping->Partition);
 
 	KeAcquireSpinLock(&pFileContext->Lock, &OldIrql);
 	if (pFileContext->MappingCount >= HVMM_MAX_MAPPINGS_PER_HANDLE) {
 		KeReleaseSpinLock(&pFileContext->Lock, OldIrql);
 		KDbgPrintString("VidMapGpaRange: too many live mappings on this handle");
 		VidReleaseGpaMapping(pMapping);
-		ObDereferenceObject(objVmPartition);
 		return FALSE;
 	}
 	pFileContext->MappingCount++;
@@ -1475,7 +1493,6 @@ BOOLEAN VidMapGpaRange(PFILE_OBJECT FileObject, PCHAR pBuffer, ULONG inLen, ULON
 
 	KDbgLog16("VidMapGpaRange mapped bytes", MappedBytes);
 
-	ObDereferenceObject(objVmPartition);
 	return TRUE;
 }
 

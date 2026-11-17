@@ -17,28 +17,20 @@
 
 //
 // Registry of open contexts so HvmmMappedReadPhysicalMemory can find a mapping by
-// hvlib partition handle. Guarded by a critical section initialised on first use.
+// hvlib partition handle. A slim reader/writer lock guards it: reads through
+// HvmmMappedReadPhysicalMemory hold it shared for the whole copy, and
+// HvmmMappedClose takes it exclusive to unregister, so a context is never freed
+// under a read that found it.
 //
 
 static PHVMM_MAPPED_MEMORY g_MappedContexts[HVMM_MAPPED_MAX_CONTEXTS];
-static CRITICAL_SECTION g_MappedLock;
-static INIT_ONCE g_MappedLockInit = INIT_ONCE_STATIC_INIT;
-
-static BOOL CALLBACK HvmmMappedInitLock(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
-{
-	UNREFERENCED_PARAMETER(InitOnce);
-	UNREFERENCED_PARAMETER(Parameter);
-	UNREFERENCED_PARAMETER(Context);
-	InitializeCriticalSection(&g_MappedLock);
-	return TRUE;
-}
+static SRWLOCK g_MappedLock = SRWLOCK_INIT;
 
 static BOOLEAN HvmmMappedRegister(PHVMM_MAPPED_MEMORY Mapped)
 {
 	ULONG i;
 	BOOLEAN Registered = FALSE;
-	InitOnceExecuteOnce(&g_MappedLockInit, HvmmMappedInitLock, NULL, NULL);
-	EnterCriticalSection(&g_MappedLock);
+	AcquireSRWLockExclusive(&g_MappedLock);
 	for (i = 0; i < HVMM_MAPPED_MAX_CONTEXTS; i++) {
 		if (g_MappedContexts[i] == NULL) {
 			g_MappedContexts[i] = Mapped;
@@ -46,42 +38,42 @@ static BOOLEAN HvmmMappedRegister(PHVMM_MAPPED_MEMORY Mapped)
 			break;
 		}
 	}
-	LeaveCriticalSection(&g_MappedLock);
+	ReleaseSRWLockExclusive(&g_MappedLock);
 	return Registered;
 }
 
 static VOID HvmmMappedUnregister(PHVMM_MAPPED_MEMORY Mapped)
 {
 	ULONG i;
-	InitOnceExecuteOnce(&g_MappedLockInit, HvmmMappedInitLock, NULL, NULL);
-	EnterCriticalSection(&g_MappedLock);
+	AcquireSRWLockExclusive(&g_MappedLock);
 	for (i = 0; i < HVMM_MAPPED_MAX_CONTEXTS; i++) {
 		if (g_MappedContexts[i] == Mapped) {
 			g_MappedContexts[i] = NULL;
 		}
 	}
-	LeaveCriticalSection(&g_MappedLock);
+	ReleaseSRWLockExclusive(&g_MappedLock);
 }
+
+//
+// Caller holds g_MappedLock shared.
+//
 
 static PHVMM_MAPPED_MEMORY HvmmMappedLookup(ULONG64 Partition)
 {
 	ULONG i;
-	PHVMM_MAPPED_MEMORY Found = NULL;
-	InitOnceExecuteOnce(&g_MappedLockInit, HvmmMappedInitLock, NULL, NULL);
-	EnterCriticalSection(&g_MappedLock);
 	for (i = 0; i < HVMM_MAPPED_MAX_CONTEXTS; i++) {
 		if (g_MappedContexts[i] != NULL && g_MappedContexts[i]->Partition == Partition) {
-			Found = g_MappedContexts[i];
-			break;
+			return g_MappedContexts[i];
 		}
 	}
-	LeaveCriticalSection(&g_MappedLock);
-	return Found;
+	return NULL;
 }
 
 //
 // Raw IOCTL wrappers
 //
+
+static UINT32 g_LastQueriedVersion = 0;
 
 BOOLEAN HvmmQueryMappingSupport(_In_ HANDLE DeviceHandle, _Out_opt_ PUINT64 MaxMapLength)
 {
@@ -112,7 +104,7 @@ BOOLEAN HvmmQueryMappingSupport(_In_ HANDLE DeviceHandle, _Out_opt_ PUINT64 MaxM
 
 	if (BytesReturned != sizeof(Output) ||
 		Output.Signature != HVMM_MAPPING_SIGNATURE ||
-		Output.Version != HVMM_MAPPING_VERSION ||
+		Output.Version < 1 ||
 		Output.MaxMapLength < HVMM_MAP_GPA_MIN_MAX_LENGTH ||
 		(Output.MaxMapLength & (PAGE_SIZE - 1)) != 0) {
 		return FALSE;
@@ -121,6 +113,7 @@ BOOLEAN HvmmQueryMappingSupport(_In_ HANDLE DeviceHandle, _Out_opt_ PUINT64 MaxM
 	if (MaxMapLength != NULL) {
 		*MaxMapLength = Output.MaxMapLength;
 	}
+	g_LastQueriedVersion = Output.Version;
 	return TRUE;
 }
 
@@ -423,6 +416,7 @@ BOOLEAN HvmmMappedOpen(_In_ ULONG64 Partition, _In_opt_ HANDLE DeviceHandle, _Ou
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return FALSE;
 	}
+	Ctx->DriverVersion = g_LastQueriedVersion;
 
 	if (!HvmmMappedLoadRuns(Ctx)) {
 		HvmmMappedClose(Ctx);
@@ -592,11 +586,71 @@ VOID HvmmMappedClose(_In_opt_ PHVMM_MAPPED_MEMORY Mapped)
 
 BOOLEAN HvmmMappedReadPhysicalMemory(_In_ ULONG64 PartitionHandle, _In_ UINT64 StartPosition, _In_ UINT64 ReadByteCount, _Inout_ PVOID ClientBuffer, _In_ READ_MEMORY_METHOD Method)
 {
-	PHVMM_MAPPED_MEMORY Mapped = HvmmMappedLookup(PartitionHandle);
+	PHVMM_MAPPED_MEMORY Mapped;
+	BOOLEAN Result;
 
+	AcquireSRWLockShared(&g_MappedLock);
+	Mapped = HvmmMappedLookup(PartitionHandle);
 	if (Mapped != NULL) {
-		return HvmmMappedRead(Mapped, StartPosition, ClientBuffer, ReadByteCount);
+		Result = HvmmMappedRead(Mapped, StartPosition, ClientBuffer, ReadByteCount);
+		ReleaseSRWLockShared(&g_MappedLock);
+		return Result;
 	}
+	ReleaseSRWLockShared(&g_MappedLock);
 
 	return SdkReadPhysicalMemory(PartitionHandle, StartPosition, ReadByteCount, ClientBuffer, Method);
+}
+
+//
+// Ask the driver to re-check every mapping of the device handle. A driver older than mapping
+// version 2 has no such request; the answer is then TRUE (nothing known to be wrong).
+// FALSE when the driver dropped at least one mapping, or when the request failed: the
+// caller then closes the context and reads through the driver from then on.
+//
+
+BOOLEAN HvmmMappedVerify(_In_ PHVMM_MAPPED_MEMORY Mapped)
+{
+	UINT64 Input = 0;
+	HVMM_VERIFY_GPA_MAPPINGS_OUTPUT Output;
+	DWORD BytesReturned = 0;
+
+	if (Mapped == NULL) {
+		return FALSE;
+	}
+	if (Mapped->DriverVersion < 2) {
+		return TRUE;
+	}
+
+	RtlZeroMemory(&Output, sizeof(Output));
+	if (!DeviceIoControl(Mapped->DeviceHandle, HVMM_IOCTL_VERIFY_GPA_MAPPINGS, &Input, sizeof(Input), &Output, sizeof(Output), &BytesReturned, NULL) ||
+		BytesReturned < sizeof(Output)) {
+		return FALSE;
+	}
+
+	Mapped->VerifyCalls++;
+	return (Output.Dropped == 0 && Output.Checked >= Mapped->ChunkCount) ? TRUE : FALSE;
+}
+
+//
+// Copy through the mapping with the fault caught. The driver unmaps a range when its VM goes
+// away, so a copy can fault at any time; it then answers FALSE and the caller falls back.
+//
+
+BOOLEAN HvmmMappedCopyOut(_In_ PHVMM_MAPPED_MEMORY Mapped, _In_ UINT64 Gpa, _Out_writes_bytes_(Length) PVOID Buffer, _In_ UINT64 Length)
+{
+	PHVMM_MAPPED_CHUNK Chunk;
+	UINT64 Offset;
+
+	if (Mapped == NULL || Buffer == NULL) {
+		return FALSE;
+	}
+	Chunk = HvmmMappedFindChunk(Mapped, Gpa);
+	if (Chunk == NULL) {
+		return FALSE;
+	}
+	Offset = Gpa - Chunk->GpaStart;
+	if (Length > Chunk->Length - Offset) {
+		return FALSE;
+	}
+	return HvmmMappedCopy(Buffer, Chunk->UserVa + Offset, (SIZE_T)Length);
 }
